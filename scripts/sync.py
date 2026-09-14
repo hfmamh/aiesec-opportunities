@@ -68,6 +68,7 @@ def diff_and_upsert_dim(client, today_iso, rows):
 
         record = {
             "id": opp_id,
+            "first_seen_at": prior["first_seen_at"],
             "last_seen_at": now,
             "times_seen": prior["times_seen"] + 1,
             "is_active": True,
@@ -98,7 +99,17 @@ def diff_and_upsert_dim(client, today_iso, rows):
 
     for opp_id, prior in existing_by_id.items():
         if prior["is_active"] and opp_id not in today_by_id:
-            dim_upserts.append({"id": opp_id, "is_active": False})
+            dim_upserts.append({
+                "id": opp_id,
+                "first_seen_at": prior["first_seen_at"],
+                "last_seen_at": prior["last_seen_at"],
+                "times_seen": prior["times_seen"],
+                "is_active": False,
+                "current_title": prior["current_title"],
+                "current_location": prior["current_location"],
+                "current_country": prior["current_country"],
+                "current_company": prior["current_company"],
+            })
             events.append({"opportunity_id": opp_id, "event_type": "closed"})
             closed += 1
 
