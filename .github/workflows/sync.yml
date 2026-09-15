@@ -2,7 +2,7 @@ name: Sync AIESEC opportunities
 
 on:
   schedule:
-    - cron: "0 6 * * *" # 06:00 UTC daily
+    - cron: "0 */4 * * *" # every 4 hours, on the hour (00:00, 04:00, ... UTC)
   workflow_dispatch: {}
 
 jobs:

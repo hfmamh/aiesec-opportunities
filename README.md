@@ -8,7 +8,7 @@ at personal-project scale.
 
 ## How it works
 
-- `.github/workflows/sync.yml` runs `scripts/sync.py` daily at 06:00 UTC (and
+- `.github/workflows/sync.yml` runs `scripts/sync.py` every 4 hours (and
   on-demand via the Actions tab "Run workflow" button).
 - `scripts/aiesec_client.py` pages through the full GraphQL result set for
   today's opportunities.
