@@ -26,6 +26,13 @@ query SearchOpportunityTitles($page: Int, $per_page: Int, $filters: OpportunityF
           name
         }
       }
+      specifics_info {
+        salary
+        salary_currency {
+          alphabetic_code
+        }
+        salary_periodicity
+      }
     }
     paging {
       total_items
@@ -35,6 +42,31 @@ query SearchOpportunityTitles($page: Int, $per_page: Int, $filters: OpportunityF
   }
 }
 """
+
+
+def _dig(obj, *keys):
+    """Safely walks nested dicts, returning None as soon as a key is missing."""
+    for key in keys:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return obj
+
+
+# Single source of truth for what gets tracked per opportunity. To track a new
+# field: add it to QUERY above, then add one entry here — sync.py, the
+# snapshot table, and the diff/event logic all pick it up automatically.
+# You'll still need to add the matching column(s) in sql/schema.sql (see
+# sql/migrations/ for how to add one to the live database).
+FIELD_EXTRACTORS = {
+    "title": lambda op: op.get("title"),
+    "location": lambda op: op.get("location"),
+    "country": lambda op: _dig(op, "host_lc", "address_detail", "country"),
+    "company": lambda op: _dig(op, "branch", "company", "name"),
+    "salary": lambda op: _dig(op, "specifics_info", "salary"),
+    "salary_currency": lambda op: _dig(op, "specifics_info", "salary_currency", "alphabetic_code"),
+    "salary_periodicity": lambda op: _dig(op, "specifics_info", "salary_periodicity"),
+}
 
 
 def _api_key():
@@ -110,23 +142,13 @@ def fetch_all(per_page=200, programmes=(8,), earliest_start_date=None):
 
 
 def to_rows(result):
-    """Flattens a single page's GraphQL response into simple dicts."""
+    """Flattens a single page's GraphQL response into simple dicts, one per
+    field in FIELD_EXTRACTORS plus id."""
     rows = []
     items = result["data"]["allOpportunity"]["data"]
     for op in items:
-        country = None
-        if op.get("host_lc") and op["host_lc"].get("address_detail"):
-            country = op["host_lc"]["address_detail"].get("country")
-
-        company = None
-        if op.get("branch") and op["branch"].get("company"):
-            company = op["branch"]["company"].get("name")
-
-        rows.append({
-            "id": str(op.get("id")),
-            "title": op.get("title"),
-            "location": op.get("location"),
-            "country": country,
-            "company": company,
-        })
+        row = {"id": str(op.get("id"))}
+        for field, extract in FIELD_EXTRACTORS.items():
+            row[field] = extract(op)
+        rows.append(row)
     return rows

@@ -74,6 +74,31 @@ copy .env.example .env   # fill in the three values
 python scripts\sync.py
 ```
 
+## Adding a new tracked field
+
+Fields are declared once in `FIELD_EXTRACTORS` in `scripts/aiesec_client.py`
+and flow through the whole pipeline automatically — the snapshot table,
+`opportunities_dim`, and the created/updated/closed diff logic in
+`scripts/sync.py` all key off that registry, not a field list you have to
+update in multiple places. To add one:
+
+1. Add the field to the `QUERY` string in `scripts/aiesec_client.py`.
+2. Add one entry to `FIELD_EXTRACTORS` mapping a column name to a function
+   that pulls it out of the raw GraphQL `op` object (use the `_dig` helper
+   for nested fields).
+3. Add the matching database columns: a plain column on
+   `opportunities_snapshot`, and a `current_<field>` column on
+   `opportunities_dim`.
+   - **Fresh install**: add the columns directly to `sql/schema.sql`.
+   - **Existing/live database**: add a new numbered file under
+     `sql/migrations/` (e.g. `0002_add_whatever.sql`) with the `ALTER TABLE`
+     statements, run it once in the Supabase SQL editor, and mirror the same
+     columns into `sql/schema.sql` so a fresh install matches.
+
+Nothing else needs to change — `sync.py` derives `TRACKED_FIELDS` from
+`FIELD_EXTRACTORS`, so the new field is automatically snapshotted daily and
+tracked for created/updated/closed events.
+
 ## Rotating the AIESEC API key
 
 If the pipeline starts failing with 401/402/403s, the embedded public key

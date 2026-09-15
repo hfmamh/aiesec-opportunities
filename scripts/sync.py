@@ -3,10 +3,10 @@ import json
 import sys
 import time
 
-from aiesec_client import fetch_all
+from aiesec_client import FIELD_EXTRACTORS, fetch_all
 from supabase_client import get_client
 
-TRACKED_FIELDS = ["title", "location", "country", "company"]
+TRACKED_FIELDS = list(FIELD_EXTRACTORS.keys())
 
 
 def start_run(client):
@@ -51,17 +51,16 @@ def diff_and_upsert_dim(client, today_iso, rows):
         prior = existing_by_id.get(opp_id)
 
         if prior is None:
-            dim_upserts.append({
+            new_record = {
                 "id": opp_id,
                 "first_seen_at": now,
                 "last_seen_at": now,
                 "is_active": True,
                 "times_seen": 1,
-                "current_title": row["title"],
-                "current_location": row["location"],
-                "current_country": row["country"],
-                "current_company": row["company"],
-            })
+            }
+            for field in TRACKED_FIELDS:
+                new_record[f"current_{field}"] = row[field]
+            dim_upserts.append(new_record)
             events.append({"opportunity_id": opp_id, "event_type": "created"})
             created += 1
             continue
@@ -99,17 +98,16 @@ def diff_and_upsert_dim(client, today_iso, rows):
 
     for opp_id, prior in existing_by_id.items():
         if prior["is_active"] and opp_id not in today_by_id:
-            dim_upserts.append({
+            closed_record = {
                 "id": opp_id,
                 "first_seen_at": prior["first_seen_at"],
                 "last_seen_at": prior["last_seen_at"],
                 "times_seen": prior["times_seen"],
                 "is_active": False,
-                "current_title": prior["current_title"],
-                "current_location": prior["current_location"],
-                "current_country": prior["current_country"],
-                "current_company": prior["current_company"],
-            })
+            }
+            for field in TRACKED_FIELDS:
+                closed_record[f"current_{field}"] = prior[f"current_{field}"]
+            dim_upserts.append(closed_record)
             events.append({"opportunity_id": opp_id, "event_type": "closed"})
             closed += 1
 

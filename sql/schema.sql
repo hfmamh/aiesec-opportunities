@@ -1,5 +1,9 @@
 -- Run this once in the Supabase SQL editor for a fresh project.
 
+-- NOTE: this file reflects the current full schema for a fresh install.
+-- Changes to an already-running database go through sql/migrations/ instead
+-- (see that directory's README note) and get mirrored here afterwards.
+
 create table opportunities_snapshot (
   run_date date not null,
   id text not null,
@@ -7,6 +11,9 @@ create table opportunities_snapshot (
   location text,
   country text,
   company text,
+  salary numeric,
+  salary_currency text,
+  salary_periodicity text,
   primary key (run_date, id)
 );
 
@@ -19,7 +26,10 @@ create table opportunities_dim (
   current_title text,
   current_location text,
   current_country text,
-  current_company text
+  current_company text,
+  current_salary numeric,
+  current_salary_currency text,
+  current_salary_periodicity text
 );
 
 create table opportunity_events (
