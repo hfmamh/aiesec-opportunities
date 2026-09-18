@@ -3,6 +3,7 @@ import json
 import sys
 import time
 
+import notifier
 from aiesec_client import FIELD_EXTRACTORS, fetch_all
 from supabase_client import get_client
 
@@ -36,7 +37,9 @@ def upsert_snapshot(client, today, rows):
 
 def diff_and_upsert_dim(client, today_iso, rows):
     """Compares today's fetch against opportunities_dim, applies changes, and
-    returns (created_count, updated_count, closed_count, reopened_count)."""
+    returns (created_count, updated_count, closed_count, reopened_count,
+    created_rows). created_rows is the list of full today-row dicts for the
+    opportunities that were newly created this run (used for notifications)."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     today_by_id = {row["id"]: row for row in rows}
 
@@ -45,6 +48,7 @@ def diff_and_upsert_dim(client, today_iso, rows):
 
     dim_upserts = []
     events = []
+    created_rows = []
     created = updated = closed = reopened = 0
 
     for opp_id, row in today_by_id.items():
@@ -62,6 +66,7 @@ def diff_and_upsert_dim(client, today_iso, rows):
                 new_record[f"current_{field}"] = row[field]
             dim_upserts.append(new_record)
             events.append({"opportunity_id": opp_id, "event_type": "created"})
+            created_rows.append(row)
             created += 1
             continue
 
@@ -116,7 +121,7 @@ def diff_and_upsert_dim(client, today_iso, rows):
     if events:
         client.table("opportunity_events").insert(events).execute()
 
-    return created, updated, closed, reopened
+    return created, updated, closed, reopened, created_rows
 
 
 def main():
@@ -130,7 +135,7 @@ def main():
 
         archive_raw(client, today, raw_pages)
         upsert_snapshot(client, today, rows)
-        created, updated, closed, reopened = diff_and_upsert_dim(client, today, rows)
+        created, updated, closed, reopened, created_rows = diff_and_upsert_dim(client, today, rows)
 
         duration_ms = int((time.monotonic() - started) * 1000)
         finish_run(
@@ -149,6 +154,16 @@ def main():
         duration_ms = int((time.monotonic() - started) * 1000)
         finish_run(client, run_id, "failed", duration_ms=duration_ms, error=str(exc)[:2000])
         raise
+
+    # Ingestion has already succeeded and been recorded at this point. A
+    # Telegram notification failure (missing secrets, API hiccup, etc.) is
+    # logged but must not make the run fail, since the data sync worked.
+    if created_rows:
+        try:
+            notifier.notify_new_opportunities(created_rows)
+            print(f"Notified Telegram: {len(created_rows)} new opportunities")
+        except Exception as exc:
+            print(f"WARNING: Telegram notification failed: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
