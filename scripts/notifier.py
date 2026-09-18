@@ -85,6 +85,11 @@ def _format_opportunity(row, index):
             salary_line += f" / {html.escape(str(periodicity))}"
         lines.append(salary_line)
 
+    opp_id = row.get("id")
+    if opp_id:
+        url = f"https://aiesec.org/opportunity/global-talent/{html.escape(str(opp_id))}"
+        lines.append(f'<a href="{url}">Ver oportunidad →</a>')
+
     return "\n".join(lines)
 
 
