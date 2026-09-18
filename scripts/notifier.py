@@ -64,9 +64,8 @@ def send_message(text, parse_mode="HTML"):
 def _format_opportunity(row, index):
     title = html.escape(row.get("title") or "Untitled opportunity")
     company = html.escape(row.get("company") or "Unknown company")
-    place = ", ".join(
-        html.escape(str(p)) for p in (row.get("location"), row.get("country")) if p
-    )
+    country = row.get("country")
+    place = html.escape(str(country)) if country else ""
 
     lines = [f"{index}. <b>{title}</b>"]
     meta = f"<i>{company}</i>"
