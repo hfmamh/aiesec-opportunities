@@ -1,8 +1,9 @@
-"""Telegram notifications for newly created AIESEC opportunities.
+"""Telegram notifications for newly created items across both pipelines
+(AIESEC opportunities and convocatorias del Estado peruano).
 
-Sends one grouped summary message per sync run (not one message per
-opportunity) via the Telegram Bot API, using only the stdlib (urllib) to
-match the rest of this codebase's no-extra-deps style.
+Sends one grouped summary message per sync run per source (not one message
+per item) via the Telegram Bot API, using only the stdlib (urllib) to match
+the rest of this codebase's no-extra-deps style.
 """
 
 import html
@@ -12,6 +13,13 @@ import urllib.error
 import urllib.request
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
+
+# Telegram rejects messages over 4096 characters. Chunking is tracked as a
+# known gap for the AIESEC side (see TODO.md) — both message builders below
+# can in theory produce an over-limit message with enough new items in one
+# run. Kept as-is for now to match the existing AIESEC behavior rather than
+# fixing it ad hoc while adding a second source.
+TELEGRAM_MESSAGE_LIMIT = 4096
 
 
 def _bot_token():
@@ -61,6 +69,10 @@ def send_message(text, parse_mode="HTML"):
     return body
 
 
+# ============================================================
+# AIESEC opportunities
+# ============================================================
+
 def _format_opportunity(row, index):
     title = html.escape(row.get("title") or "Untitled opportunity")
     company = html.escape(row.get("company") or "Unknown company")
@@ -104,10 +116,74 @@ def format_new_opportunities_message(rows):
 
 
 def notify_new_opportunities(rows):
-    """Sends one grouped summary message for newly created opportunities.
-    No-ops if rows is empty. Raises on failure — it's up to the caller to
-    decide whether a notification failure should affect the run's outcome."""
+    """Sends one grouped summary message for newly created AIESEC
+    opportunities. No-ops if rows is empty. Raises on failure — it's up to
+    the caller to decide whether a notification failure should affect the
+    run's outcome."""
     if not rows:
         return
     message = format_new_opportunities_message(rows)
+    send_message(message)
+
+
+# ============================================================
+# Convocatorias del Estado peruano
+# ============================================================
+
+def _format_convocatoria(row, index):
+    titulo = html.escape(row.get("titulo") or "Convocatoria sin título")
+    entidad = html.escape(row.get("entidad") or "Entidad desconocida")
+    departamento = row.get("departamento")
+    distrito = row.get("distrito")
+    place_parts = [p for p in (departamento, distrito) if p]
+    place = html.escape(" · ".join(place_parts)) if place_parts else ""
+
+    lines = [f"{index}. <b>{titulo}</b>"]
+    meta = f"<i>{entidad}</i>"
+    if place:
+        meta += f" — <i>{place}</i>"
+    lines.append(meta)
+
+    sueldo = row.get("sueldo")
+    if sueldo:
+        lines.append(f"\U0001f4b0 S/ {sueldo:,.0f}")
+
+    details = []
+    modalidad = row.get("modalidad")
+    if modalidad:
+        details.append(html.escape(str(modalidad)))
+    vacantes = row.get("vacantes")
+    if vacantes:
+        details.append(f"{vacantes} vacante{'s' if vacantes != 1 else ''}")
+    if details:
+        lines.append(" · ".join(details))
+
+    fecha_cierre = row.get("fecha_cierre")
+    if fecha_cierre:
+        lines.append(f"\U0001f4c5 Cierra {html.escape(str(fecha_cierre))}")
+
+    url = row.get("url")
+    if url:
+        lines.append(f'<a href="{html.escape(url)}">Ver convocatoria →</a>')
+
+    return "\n".join(lines)
+
+
+def format_new_convocatorias_message(rows):
+    """Builds one grouped HTML summary message for the given newly-created
+    convocatoria rows (full dicts as produced by
+    convocatorias_client.to_rows)."""
+    count = len(rows)
+    noun = "nueva convocatoria" if count == 1 else "nuevas convocatorias"
+    header = f"<b>{count} {noun} del Estado</b>"
+    blocks = [_format_convocatoria(row, i) for i, row in enumerate(rows, start=1)]
+    return header + "\n\n" + "\n\n".join(blocks)
+
+
+def notify_new_convocatorias(rows):
+    """Sends one grouped summary message for newly created convocatorias.
+    Same no-op/raise contract as notify_new_opportunities."""
+    if not rows:
+        return
+    message = format_new_convocatorias_message(rows)
     send_message(message)

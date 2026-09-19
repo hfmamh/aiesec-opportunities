@@ -1,4 +1,4 @@
-name: Sync AIESEC opportunities
+name: Sync opportunities & convocatorias
 
 on:
   schedule:
@@ -17,6 +17,10 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Runs both pipelines (AIESEC opportunities + convocatorias del Estado
+      # peruano). Each source is wrapped independently in scripts/sync.py's
+      # main(): one failing doesn't stop the other, and the job only fails
+      # (non-zero exit) if at least one source failed.
       - run: python scripts/sync.py
         env:
           AIESEC_API_KEY: ${{ secrets.AIESEC_API_KEY }}
