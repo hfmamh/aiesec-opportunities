@@ -9,17 +9,21 @@ the rest of this codebase's no-extra-deps style.
 import html
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
 
-# Telegram rejects messages over 4096 characters. Chunking is tracked as a
-# known gap for the AIESEC side (see TODO.md) — both message builders below
-# can in theory produce an over-limit message with enough new items in one
-# run. Kept as-is for now to match the existing AIESEC behavior rather than
-# fixing it ad hoc while adding a second source.
+# Telegram rejects messages over 4096 characters. _chunk_blocks/_send_grouped
+# below split a run's items across multiple messages when needed, so a big
+# backfill (or just a busy day) never silently fails to notify (see TODO.md).
 TELEGRAM_MESSAGE_LIMIT = 4096
+
+# Reserves room in each chunk's budget for its header line (e.g. "12 nuevas
+# convocatorias del Estado (3/4)") plus the blank line before the first
+# item. Generous vs. the ~60-80 chars a real header line runs.
+HEADER_MARGIN = 200
 
 
 def _bot_token():
@@ -37,8 +41,11 @@ def _chat_id():
 
 
 def send_message(text, parse_mode="HTML"):
-    """Sends a message via the Telegram Bot API. Raises RuntimeError on any
-    failure (missing credentials, HTTP error, or an ok=false API response)."""
+    """Sends a message via the Telegram Bot API. Retries once on a 429
+    (flood control), sleeping for the `retry_after` Telegram reports —
+    needed because a chunked notification can send dozens of messages in a
+    burst. Raises RuntimeError on any other failure (missing credentials,
+    HTTP error, or an ok=false API response)."""
     token = _bot_token()
     chat_id = _chat_id()
 
@@ -49,24 +56,73 @@ def send_message(text, parse_mode="HTML"):
         "disable_web_page_preview": True,
     }
 
-    req = urllib.request.Request(
-        f"{TELEGRAM_API_BASE}/bot{token}/sendMessage",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code} sending Telegram message: {error_body}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Failed to reach Telegram API: {e}") from e
+    for attempt in range(2):
+        req = urllib.request.Request(
+            f"{TELEGRAM_API_BASE}/bot{token}/sendMessage",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            if e.code == 429 and attempt == 0:
+                retry_after = 5
+                try:
+                    retry_after = json.loads(error_body)["parameters"]["retry_after"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+                time.sleep(retry_after)
+                continue
+            raise RuntimeError(f"HTTP {e.code} sending Telegram message: {error_body}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Failed to reach Telegram API: {e}") from e
 
     if not body.get("ok"):
         raise RuntimeError(f"Telegram API returned ok=false: {body}")
     return body
+
+
+def _chunk_blocks(blocks, limit=TELEGRAM_MESSAGE_LIMIT, margin=HEADER_MARGIN):
+    """Greedily groups pre-formatted item blocks (one per item) into chunks
+    whose combined length stays within `limit` once `margin` is set aside
+    for that chunk's header. Never splits a single item's block across two
+    messages — if one block alone exceeds the budget, it still gets sent
+    alone rather than dropped."""
+    budget = limit - margin
+    chunks = []
+    current = []
+    current_len = 0
+    for block in blocks:
+        block_len = len(block) + 2  # + the "\n\n" separator
+        if current and current_len + block_len > budget:
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(block)
+        current_len += block_len
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _send_grouped(header_fn, blocks):
+    """Sends one Telegram message per chunk of `blocks`, chunked so none
+    exceeds Telegram's character limit. header_fn(chunk_index, chunk_count)
+    builds that chunk's header line (chunk_count == 1 for an unsplit run). A
+    1s pace between messages keeps a large multi-chunk run under Telegram's
+    per-chat flood-control limit (send_message also retries once on a 429,
+    as a backstop if pacing alone isn't enough)."""
+    chunks = _chunk_blocks(blocks)
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, start=1):
+        header = header_fn(i, total)
+        send_message(header + "\n\n" + "\n\n".join(chunk))
+        if i < total:
+            time.sleep(1)
 
 
 # ============================================================
@@ -104,26 +160,24 @@ def _format_opportunity(row, index):
     return "\n".join(lines)
 
 
-def format_new_opportunities_message(rows):
-    """Builds one grouped HTML summary message for the given newly-created
-    opportunity rows (full dicts with title/location/country/company/salary/
-    salary_currency/salary_periodicity, as produced by aiesec_client.to_rows)."""
-    count = len(rows)
+def _opportunities_header(count, chunk_index, chunk_count):
     noun = "nueva oportunidad" if count == 1 else "nuevas oportunidades"
     header = f"<b>{count} {noun} AIESEC</b>"
-    blocks = [_format_opportunity(row, i) for i, row in enumerate(rows, start=1)]
-    return header + "\n\n" + "\n\n".join(blocks)
+    if chunk_count > 1:
+        header += f" ({chunk_index}/{chunk_count})"
+    return header
 
 
 def notify_new_opportunities(rows):
-    """Sends one grouped summary message for newly created AIESEC
-    opportunities. No-ops if rows is empty. Raises on failure — it's up to
-    the caller to decide whether a notification failure should affect the
-    run's outcome."""
+    """Sends one or more grouped summary messages (chunked to Telegram's
+    character limit) for newly created AIESEC opportunities. No-ops if rows
+    is empty. Raises on failure — it's up to the caller to decide whether a
+    notification failure should affect the run's outcome."""
     if not rows:
         return
-    message = format_new_opportunities_message(rows)
-    send_message(message)
+    count = len(rows)
+    blocks = [_format_opportunity(row, i) for i, row in enumerate(rows, start=1)]
+    _send_grouped(lambda i, total: _opportunities_header(count, i, total), blocks)
 
 
 # ============================================================
@@ -169,21 +223,20 @@ def _format_convocatoria(row, index):
     return "\n".join(lines)
 
 
-def format_new_convocatorias_message(rows):
-    """Builds one grouped HTML summary message for the given newly-created
-    convocatoria rows (full dicts as produced by
-    convocatorias_client.to_rows)."""
-    count = len(rows)
+def _convocatorias_header(count, chunk_index, chunk_count):
     noun = "nueva convocatoria" if count == 1 else "nuevas convocatorias"
     header = f"<b>{count} {noun} del Estado</b>"
-    blocks = [_format_convocatoria(row, i) for i, row in enumerate(rows, start=1)]
-    return header + "\n\n" + "\n\n".join(blocks)
+    if chunk_count > 1:
+        header += f" ({chunk_index}/{chunk_count})"
+    return header
 
 
 def notify_new_convocatorias(rows):
-    """Sends one grouped summary message for newly created convocatorias.
-    Same no-op/raise contract as notify_new_opportunities."""
+    """Sends one or more grouped summary messages (chunked to Telegram's
+    character limit) for newly created convocatorias. Same no-op/raise
+    contract as notify_new_opportunities."""
     if not rows:
         return
-    message = format_new_convocatorias_message(rows)
-    send_message(message)
+    count = len(rows)
+    blocks = [_format_convocatoria(row, i) for i, row in enumerate(rows, start=1)]
+    _send_grouped(lambda i, total: _convocatorias_header(count, i, total), blocks)
