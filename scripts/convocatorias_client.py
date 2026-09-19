@@ -151,6 +151,11 @@ def fetch_page(page=1):
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # The site 404s once you page past the last one, instead of
+            # returning a 200 with zero cards — that's how fetch_all knows
+            # pagination is over.
+            return None
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {e.code} fetching page {page}: {body[:500]}") from e
 
@@ -178,6 +183,8 @@ def fetch_all():
     page = 1
     while page <= MAX_PAGES:
         html_text = fetch_page(page)
+        if html_text is None:
+            break
         articles = [
             parsed
             for chunk in ARTICLE_RE.findall(html_text)
