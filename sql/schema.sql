@@ -102,6 +102,17 @@ create table convocatoria_events (
 create index on convocatorias_snapshot (id);
 create index on convocatoria_events (convocatoria_id);
 
+-- Narrows what convocatorias_client.py fetches to only listings matching one
+-- of these keywords (OR semantics, via the site's own ?q= search), instead
+-- of scraping the entire catalog. Editable without a deploy — sync.py reads
+-- the active rows on every run. Seed with real keywords before the first
+-- run, e.g.: insert into convocatoria_keywords (keyword) values ('Biologo').
+create table convocatoria_keywords (
+  keyword text primary key,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
 -- ============================================================
 -- Shared across sources
 -- ============================================================

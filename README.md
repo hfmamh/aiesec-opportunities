@@ -16,8 +16,12 @@ personal-project scale.
   plain server-rendered HTML with `robots.txt` explicitly allowing
   `/convocatorias/`, and has a paid API for higher-volume use that wasn't in
   budget for this project — so this pipeline scrapes its HTML instead, at a
-  polite request rate (one page every 0.5s, ~95s for the full ~190-page
-  catalog per run).
+  polite request rate (one page every 0.5s). Rather than the full catalog
+  (~190 pages), it narrows the fetch server-side to the keywords listed in
+  the `convocatoria_keywords` table, using the site's own `?q=kw1,kw2`
+  search (OR semantics) — a run currently fetches a handful of pages, not
+  190. This scope applies to both storage and Telegram notifications: what
+  isn't fetched is never saved or notified.
 
 Both sources follow the same pattern: append-only daily snapshot, a "dim"
 table with each item's current state, and an events log of
@@ -48,8 +52,11 @@ always answer "when did this first appear" or "when did it close".
 - `scripts/aiesec_client.py` pages through the full GraphQL result set for
   today's opportunities.
 - `scripts/convocatorias_client.py` pages through
-  `convocatoriasestado.pe/convocatorias/?page=N` and parses each listing
-  card's HTML.
+  `convocatoriasestado.pe/convocatorias/?q=<keywords>&page=N` (keywords come
+  from `convocatoria_keywords`, read fresh each run by `sync.py`) and parses
+  each listing card's HTML. If there are zero active keywords, the run skips
+  the fetch entirely (0 items, still a success) rather than falling back to
+  scraping the full catalog.
 
 See `sql/schema.sql` for the full table definitions.
 
@@ -98,7 +105,26 @@ or a group/channel the bot has been added to), then open
 row here, its notification step fails loudly (logged, doesn't fail the
 sync) rather than silently going nowhere.
 
-### 4. Looker Studio dashboard
+### 4. Convocatorias keywords
+
+The convocatorias source only fetches (and therefore only ever stores or
+notifies) listings matching one of the keywords in `convocatoria_keywords` —
+also a database row, not a config file, so changing scope doesn't need a
+deploy. Seed it with whatever's relevant (SQL editor):
+
+```sql
+insert into convocatoria_keywords (keyword, is_active) values
+  ('Biologo', true),
+  ('Biologia', true);
+```
+
+Keywords are OR'd (matches any, not all) via the site's own `?q=kw1,kw2`
+search. Deactivate one with `update convocatoria_keywords set is_active =
+false where keyword = '...'` rather than deleting it, to keep the history of
+what's been searched. If every row is inactive, the run skips the fetch
+(0 items, still a success) instead of falling back to the full catalog.
+
+### 5. Looker Studio dashboard
 
 1. In Supabase, go to Project Settings -> Database and copy the connection
    pooler host/port/database/user/password.
