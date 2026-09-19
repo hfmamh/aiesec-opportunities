@@ -37,6 +37,24 @@ def upsert_snapshot(client, snapshot_table, today, rows):
     client.table(snapshot_table).upsert(records, on_conflict="run_date,id").execute()
 
 
+DIM_PAGE_SIZE = 1000  # Supabase's REST API caps a single select() at 1000 rows
+
+
+def fetch_all_rows(client, table):
+    """select("*") on a Supabase table, paginated past the API's 1000-row
+    cap. Without this, any table over 1000 rows would silently only return
+    its first page."""
+    rows = []
+    start = 0
+    while True:
+        page = client.table(table).select("*").range(start, start + DIM_PAGE_SIZE - 1).execute().data
+        rows.extend(page)
+        if len(page) < DIM_PAGE_SIZE:
+            break
+        start += DIM_PAGE_SIZE
+    return rows
+
+
 def diff_and_upsert_dim(client, dim_table, events_table, event_id_column, tracked_fields, today_iso, rows):
     """Compares today's fetch against `dim_table`, applies changes, and
     returns (created_count, updated_count, closed_count, reopened_count,
@@ -52,7 +70,7 @@ def diff_and_upsert_dim(client, dim_table, events_table, event_id_column, tracke
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     today_by_id = {row["id"]: row for row in rows}
 
-    existing = client.table(dim_table).select("*").execute().data
+    existing = fetch_all_rows(client, dim_table)
     existing_by_id = {row["id"]: row for row in existing}
 
     dim_upserts = []
