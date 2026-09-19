@@ -6,6 +6,13 @@ robots.txt explicitly allows this path (and even lists AI crawlers by name),
 and the page has no anti-bot layer, so a polite delay between requests is
 the only courtesy this needs.
 
+Callers should normally pass `keywords` (see fetch_all/fetch_page) so this
+narrows to the site's own server-side search (?q=kw1,kw2, OR semantics)
+instead of scraping the entire catalog (~191 pages / ~3,800 listings as of
+2026-09). sync.py sources the active keyword list from the
+`convocatoria_keywords` table. `keywords=None` still scrapes everything,
+for callers that explicitly want the unfiltered catalog.
+
 Follows the same shape as aiesec_client.py: FIELD_EXTRACTORS is the single
 source of truth for what gets tracked per listing. To track a new field:
 1. Make sure _parse_article captures the raw string for it.
@@ -20,6 +27,7 @@ import html
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE_URL = "https://convocatoriasestado.pe"
@@ -134,8 +142,16 @@ FIELD_EXTRACTORS = {
 }
 
 
-def fetch_page(page=1):
-    url = f"{BASE_URL}{LISTING_PATH}?page={page}"
+def fetch_page(page=1, keywords=None):
+    if keywords:
+        # The site's own search takes a comma-separated `q` param with OR
+        # semantics (matches any keyword). Keep the comma literal (that's
+        # the separator the site expects) and percent-encode everything
+        # else (spaces, accents) via quote's `safe` arg.
+        q = urllib.parse.quote(",".join(keywords), safe=",")
+        url = f"{BASE_URL}{LISTING_PATH}?q={q}&page={page}"
+    else:
+        url = f"{BASE_URL}{LISTING_PATH}?page={page}"
     req = urllib.request.Request(
         url,
         headers={
@@ -172,17 +188,19 @@ def to_rows(raw_items):
     return rows
 
 
-def fetch_all():
-    """Pages through the full active listing. Returns (raw_pages, rows) where
-    raw_pages is a list of {"page": n, "items": [raw dicts]} (used for the
-    Storage archive) and rows is every listing flattened via
-    FIELD_EXTRACTORS."""
+def fetch_all(keywords=None):
+    """Pages through the listing, optionally narrowed server-side to only
+    listings matching any of `keywords` (OR semantics, via the site's own
+    `q` param). Returns (raw_pages, rows) where raw_pages is a list of
+    {"page": n, "items": [raw dicts]} (used for the Storage archive) and
+    rows is every listing flattened via FIELD_EXTRACTORS. `keywords=None`
+    (or empty) preserves today's unfiltered full-catalog behavior."""
     raw_pages = []
     rows = []
 
     page = 1
     while page <= MAX_PAGES:
-        html_text = fetch_page(page)
+        html_text = fetch_page(page, keywords=keywords)
         if html_text is None:
             break
         articles = [

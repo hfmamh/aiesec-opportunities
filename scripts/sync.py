@@ -171,11 +171,35 @@ def run_aiesec(client):
     return len(rows), len(raw_pages), created_rows
 
 
+def get_active_keywords(client):
+    """Returns the list of active convocatoria_keywords.keyword values.
+    Paginated defensively via fetch_all_rows even though this table will
+    never realistically exceed 1000 rows."""
+    rows = fetch_all_rows(client, "convocatoria_keywords")
+    return [row["keyword"] for row in rows if row.get("is_active")]
+
+
 def run_convocatorias(client):
     """Fetches, archives, snapshots and diffs today's convocatorias from
-    convocatoriasestado.pe. Same return/raise contract as run_aiesec."""
+    convocatoriasestado.pe, narrowed server-side to the active keywords in
+    `convocatoria_keywords`. Same return/raise contract as run_aiesec.
+
+    If there are zero active keywords, this deliberately skips the fetch
+    (rather than falling back to the full unfiltered catalog, which would
+    silently re-trigger a ~191-page scrape) and reports 0 items fetched as
+    a successful run."""
     today = datetime.date.today().isoformat()
-    raw_pages, rows = convocatorias_client.fetch_all()
+
+    keywords = get_active_keywords(client)
+    if not keywords:
+        print(
+            "[convocatorias] WARNING: no active keywords in convocatoria_keywords; "
+            "skipping fetch (0 items) rather than scraping the full catalog",
+            file=sys.stderr,
+        )
+        raw_pages, rows = [], []
+    else:
+        raw_pages, rows = convocatorias_client.fetch_all(keywords=keywords)
 
     archive_raw(client, "convocatorias", today, raw_pages)
     upsert_snapshot(client, "convocatorias_snapshot", today, rows)
