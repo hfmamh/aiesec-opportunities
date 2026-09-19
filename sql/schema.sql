@@ -119,6 +119,15 @@ create table ingestion_runs (
 
 create index on ingestion_runs (source, run_at);
 
+-- Maps each source to the Telegram chat its notifications go to, so adding
+-- a channel (or moving a source to a different chat) is a data change, not
+-- a code/secret change. Seed with real chat_id values before the first run,
+-- e.g.: insert into notification_channels values ('aiesec', '<chat id>').
+create table notification_channels (
+  source text primary key,
+  chat_id text not null
+);
+
 -- Also create a Storage bucket named "raw-snapshots" (Storage tab in the
 -- Supabase dashboard, or SQL: select storage.create_bucket('raw-snapshots')
 -- depending on your project version). Each source archives its raw fetch

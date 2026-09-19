@@ -213,7 +213,7 @@ def run_source(client, source, run_fn, notify_fn):
     # treated as a pipeline failure, since the data sync worked.
     if created_rows:
         try:
-            notify_fn(created_rows)
+            notify_fn(client, created_rows)
             print(f"[{source}] Notified Telegram: {len(created_rows)} new items")
         except Exception as exc:
             print(f"[{source}] WARNING: Telegram notification failed: {exc}", file=sys.stderr)

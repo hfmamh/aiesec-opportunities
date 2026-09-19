@@ -33,21 +33,23 @@ def _bot_token():
     return token
 
 
-def _chat_id():
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not chat_id:
-        raise RuntimeError("TELEGRAM_CHAT_ID environment variable is not set")
-    return chat_id
+def chat_id_for_source(client, source):
+    """Looks up the destination chat_id for `source` from the
+    notification_channels table — the routing lives in the database, not in
+    a GitHub secret, so adding/changing a source's chat is a data change."""
+    rows = client.table("notification_channels").select("chat_id").eq("source", source).execute().data
+    if not rows:
+        raise RuntimeError(f"No notification_channels row for source={source!r}")
+    return rows[0]["chat_id"]
 
 
-def send_message(text, parse_mode="HTML"):
+def send_message(chat_id, text, parse_mode="HTML"):
     """Sends a message via the Telegram Bot API. Retries once on a 429
     (flood control), sleeping for the `retry_after` Telegram reports —
     needed because a chunked notification can send dozens of messages in a
     burst. Raises RuntimeError on any other failure (missing credentials,
     HTTP error, or an ok=false API response)."""
     token = _bot_token()
-    chat_id = _chat_id()
 
     payload = {
         "chat_id": chat_id,
@@ -109,7 +111,7 @@ def _chunk_blocks(blocks, limit=TELEGRAM_MESSAGE_LIMIT, margin=HEADER_MARGIN):
     return chunks
 
 
-def _send_grouped(header_fn, blocks):
+def _send_grouped(chat_id, header_fn, blocks):
     """Sends one Telegram message per chunk of `blocks`, chunked so none
     exceeds Telegram's character limit. header_fn(chunk_index, chunk_count)
     builds that chunk's header line (chunk_count == 1 for an unsplit run). A
@@ -120,7 +122,7 @@ def _send_grouped(header_fn, blocks):
     total = len(chunks)
     for i, chunk in enumerate(chunks, start=1):
         header = header_fn(i, total)
-        send_message(header + "\n\n" + "\n\n".join(chunk))
+        send_message(chat_id, header + "\n\n" + "\n\n".join(chunk))
         if i < total:
             time.sleep(1)
 
@@ -168,16 +170,18 @@ def _opportunities_header(count, chunk_index, chunk_count):
     return header
 
 
-def notify_new_opportunities(rows):
+def notify_new_opportunities(client, rows):
     """Sends one or more grouped summary messages (chunked to Telegram's
-    character limit) for newly created AIESEC opportunities. No-ops if rows
-    is empty. Raises on failure — it's up to the caller to decide whether a
-    notification failure should affect the run's outcome."""
+    character limit) for newly created AIESEC opportunities, to whatever
+    chat notification_channels has configured for source='aiesec'. No-ops
+    if rows is empty. Raises on failure — it's up to the caller to decide
+    whether a notification failure should affect the run's outcome."""
     if not rows:
         return
+    chat_id = chat_id_for_source(client, "aiesec")
     count = len(rows)
     blocks = [_format_opportunity(row, i) for i, row in enumerate(rows, start=1)]
-    _send_grouped(lambda i, total: _opportunities_header(count, i, total), blocks)
+    _send_grouped(chat_id, lambda i, total: _opportunities_header(count, i, total), blocks)
 
 
 # ============================================================
@@ -231,12 +235,14 @@ def _convocatorias_header(count, chunk_index, chunk_count):
     return header
 
 
-def notify_new_convocatorias(rows):
+def notify_new_convocatorias(client, rows):
     """Sends one or more grouped summary messages (chunked to Telegram's
-    character limit) for newly created convocatorias. Same no-op/raise
-    contract as notify_new_opportunities."""
+    character limit) for newly created convocatorias, to whatever chat
+    notification_channels has configured for source='convocatorias'. Same
+    no-op/raise contract as notify_new_opportunities."""
     if not rows:
         return
+    chat_id = chat_id_for_source(client, "convocatorias")
     count = len(rows)
     blocks = [_format_convocatoria(row, i) for i, row in enumerate(rows, start=1)]
-    _send_grouped(lambda i, total: _convocatorias_header(count, i, total), blocks)
+    _send_grouped(chat_id, lambda i, total: _convocatorias_header(count, i, total), blocks)

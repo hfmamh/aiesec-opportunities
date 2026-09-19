@@ -75,11 +75,30 @@ In the repo, go to Settings -> Secrets and variables -> Actions and add:
 | `SUPABASE_URL` | Project URL from step 1 |
 | `SUPABASE_SERVICE_ROLE_KEY` | service_role key from step 1 |
 | `TELEGRAM_BOT_TOKEN` | Token from [@BotFather](https://t.me/BotFather) |
-| `TELEGRAM_CHAT_ID` | Chat/channel id the bot should post to |
 
 `convocatorias_client.py` needs no credentials — it scrapes a public page.
 
-### 3. Looker Studio dashboard
+### 3. Notification channels
+
+Which Telegram chat each source notifies is a **database row**, not a
+secret — this is what lets each source post to a different chat, and what
+makes adding a new source's channel a data change instead of a code change.
+For each source, insert a row into `notification_channels` (SQL editor):
+
+```sql
+insert into notification_channels (source, chat_id) values
+  ('aiesec', '<chat id>'),
+  ('convocatorias', '<chat id>');
+```
+
+To get a chat's `chat_id`: send any message in that chat (a DM to the bot,
+or a group/channel the bot has been added to), then open
+`https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and read the
+`"chat": {"id": ...}` field of the most recent update. If a source has no
+row here, its notification step fails loudly (logged, doesn't fail the
+sync) rather than silently going nowhere.
+
+### 4. Looker Studio dashboard
 
 1. In Supabase, go to Project Settings -> Database and copy the connection
    pooler host/port/database/user/password.
