@@ -1,4 +1,4 @@
-name: Manual biology convocatorias backfill notify
+name: Manual notification test
 
 on:
   workflow_dispatch: {}
@@ -15,7 +15,7 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - run: python -u scripts/biology_backfill_notify.py
+      - run: python scripts/test_notification_channels.py
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
