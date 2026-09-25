@@ -193,14 +193,14 @@ def _format_convocatoria(row, index):
     entidad = html.escape(row.get("entidad") or "Entidad desconocida")
     departamento = row.get("departamento")
     distrito = row.get("distrito")
-    place_parts = [p for p in (departamento, distrito) if p]
-    place = html.escape(" · ".join(place_parts)) if place_parts else ""
 
-    lines = [f"{index}. <b>{titulo}</b>"]
-    meta = f"<i>{entidad}</i>"
-    if place:
-        meta += f" — <i>{place}</i>"
-    lines.append(meta)
+    lines = [f"{index}. <b>{titulo}</b>", f"<i>{entidad}</i>"]
+
+    if departamento or distrito:
+        place = f"\U0001f4cd Departamento: <b>{html.escape(departamento or 'No especificado')}</b>"
+        if distrito:
+            place += f" · {html.escape(distrito)}"
+        lines.append(place)
 
     sueldo = row.get("sueldo")
     if sueldo:
