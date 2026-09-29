@@ -1,0 +1,31 @@
+name: Test convocatoria notification
+
+# Scrapes one live convocatoria and sends it to the convocatorias Telegram
+# chat, without writing anything to the database. See
+# scripts/test_convocatoria_notification.py.
+on:
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: "Search keyword (blank = active convocatoria_keywords)"
+        required: false
+        default: ""
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - run: python scripts/test_convocatoria_notification.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TEST_KEYWORD: ${{ inputs.keyword }}
