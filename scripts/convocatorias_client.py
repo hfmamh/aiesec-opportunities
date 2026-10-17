@@ -42,9 +42,11 @@ ARTICLE_RE = re.compile(r'<article class="card">(.*?)</article>', re.DOTALL)
 LINK_RE = re.compile(r'<a href="(/convocatoria/(\d+)-[^"]*?/)"[^>]*>([^<]+)</a>', re.DOTALL)
 ENTIDAD_RE = re.compile(r'<p class="card-entidad">([^<]*)</p>')
 SUELDO_RE = re.compile(r'<span class="sueldo">([^<]*)</span>')
-UBICACION_RE = re.compile(r'#i-pin"></use></svg>([^<]*)</span>')
-VACANTES_RE = re.compile(r'#i-vacantes"></use></svg>([^<]*)</span>')
-MODALIDAD_RE = re.compile(r'#i-maletin"></use></svg>([^<]*)</span>')
+# The site has emitted both <use ...></use> and self-closing <use .../>, so
+# match either form up to the closing </svg>.
+UBICACION_RE = re.compile(r'#i-pin"\s*/?>(?:</use>)?</svg>([^<]*)</span>')
+VACANTES_RE = re.compile(r'#i-vacantes"\s*/?>(?:</use>)?</svg>([^<]*)</span>')
+MODALIDAD_RE = re.compile(r'#i-maletin"\s*/?>(?:</use>)?</svg>([^<]*)</span>')
 BASES_RE = re.compile(r'class="card-docs[^"]*">.*?</svg>([^<]*)</span>', re.DOTALL)
 CIERRE_RE = re.compile(r'class="cierre[^"]*">.*?</svg>([^<]*)</span>', re.DOTALL)
 
