@@ -1,6 +1,6 @@
 # Opportunities & Convocatorias Pipeline
 
-Daily, cloud-hosted pipeline that tracks two job-listing sources, keeps a
+Daily, cloud-hosted pipeline that tracks three job-listing sources, keeps a
 full history of when items appear/change/close, and feeds a Looker Studio
 dashboard. Runs on GitHub Actions; storage is Supabase (Postgres + object
 storage). No server, no local machine dependency, $0/month at
@@ -22,9 +22,21 @@ personal-project scale.
   search (OR semantics) — a run currently fetches a handful of pages, not
   190. This scope applies to both storage and Telegram notifications: what
   isn't fetched is never saved or notified.
+- **Get on Board**: scrapes the public job-tag listing page at
+  [getonbrd.com.pe](https://www.getonbrd.com.pe/jobs/tag/data-engineer) for
+  the "data-engineer" tag (only tag wired up so far, hardcoded in
+  `scripts/getonboard_client.py` — not yet a configurable table like
+  `convocatoria_keywords`). `robots.txt` only disallows a named list of
+  AI-training crawlers, not generic fetches, and the listing page is plain
+  server-rendered HTML — no JS challenge was hit on a plain fetch. The
+  listing page itself already has everything this pipeline tracks (title,
+  company, location, employment type, salary when listed, posted date), so
+  unlike convocatorias this does **not** fetch each job's own detail page —
+  that would roughly 30x the request/storage volume for data this doesn't
+  need yet.
 
-Both sources follow the same pattern: append-only daily snapshot, a "dim"
-table with each item's current state, and an events log of
+All three sources follow the same pattern: append-only daily snapshot, a
+"dim" table with each item's current state, and an events log of
 created/updated/closed/reopened — so nothing is ever overwritten and you can
 always answer "when did this first appear" or "when did it close".
 
@@ -32,23 +44,30 @@ always answer "when did this first appear" or "when did it close".
 
 - `.github/workflows/sync.yml` runs `scripts/sync.py` every 4 hours (and
   on-demand via the Actions tab "Run workflow" button).
-- `scripts/sync.py`'s `main()` runs both sources independently — one
-  failing (e.g. AIESEC's key rotated, or the scraped site's markup changed)
-  never blocks the other, and each is logged as its own row in
+- `scripts/sync.py`'s `main()` runs all three sources independently — one
+  failing (e.g. AIESEC's key rotated, or a scraped site's markup changed)
+  never blocks the others, and each is logged as its own row in
   `ingestion_runs` (tagged by `source`).
 - For each source, a run:
   1. Logs a run in `ingestion_runs`.
   2. Archives the raw fetched data to the Supabase Storage bucket
      `raw-snapshots/{source}/{date}.json`.
   3. Writes today's flattened rows to `opportunities_snapshot` /
-     `convocatorias_snapshot` (append-only, one row per item per day).
-  4. Diffs against `opportunities_dim` / `convocatorias_dim` (current state
-     per item) and records `created` / `updated` / `closed` / `reopened`
-     rows in `opportunity_events` / `convocatoria_events`.
+     `convocatorias_snapshot` / `getonboard_snapshot` (append-only, one row
+     per item per day).
+  4. Diffs against `opportunities_dim` / `convocatorias_dim` /
+     `getonboard_dim` (current state per item) and records `created` /
+     `updated` / `closed` / `reopened` rows in `opportunity_events` /
+     `convocatoria_events` / `getonboard_events`.
   5. Marks the run `success` or `failed` with counts/duration/error.
   6. Sends one grouped Telegram message for that run's newly created items
      (best-effort — a notification failure is logged but doesn't fail the
-     run, since the data sync already succeeded).
+     run, since the data sync already succeeded). All three sources use the
+     same Telegram bot, but `getonboard` posts to a **separate chat** from
+     `aiesec`/`convocatorias` (see "Notification channels" below) — it's the
+     user's personal Data Engineer job search, not an AIESEC/convocatorias
+     opportunity, and they're kept out of the same conversation
+     deliberately.
 - `scripts/aiesec_client.py` pages through the full GraphQL result set for
   today's opportunities.
 - `scripts/convocatorias_client.py` pages through
@@ -57,6 +76,9 @@ always answer "when did this first appear" or "when did it close".
   each listing card's HTML. If there are zero active keywords, the run skips
   the fetch entirely (0 items, still a success) rather than falling back to
   scraping the full catalog.
+- `scripts/getonboard_client.py` fetches
+  `getonbrd.com.pe/jobs/tag/data-engineer` (one page, no detail-page
+  fetches — see the module docstring for why) and parses each card's HTML.
 
 See `sql/schema.sql` for the full table definitions.
 
@@ -83,7 +105,8 @@ In the repo, go to Settings -> Secrets and variables -> Actions and add:
 | `SUPABASE_SERVICE_ROLE_KEY` | service_role key from step 1 |
 | `TELEGRAM_BOT_TOKEN` | Token from [@BotFather](https://t.me/BotFather) |
 
-`convocatorias_client.py` needs no credentials — it scrapes a public page.
+`convocatorias_client.py` and `getonboard_client.py` need no credentials —
+both scrape a public page.
 
 ### 3. Notification channels
 
@@ -95,7 +118,8 @@ For each source, insert a row into `notification_channels` (SQL editor):
 ```sql
 insert into notification_channels (source, chat_id) values
   ('aiesec', '<chat id>'),
-  ('convocatorias', '<chat id>');
+  ('convocatorias', '<chat id>'),
+  ('getonboard', '<chat id>');
 ```
 
 To get a chat's `chat_id`: send any message in that chat (a DM to the bot,
@@ -104,6 +128,24 @@ or a group/channel the bot has been added to), then open
 `"chat": {"id": ...}` field of the most recent update. If a source has no
 row here, its notification step fails loudly (logged, doesn't fail the
 sync) rather than silently going nowhere.
+
+`getonboard` deliberately uses a **different chat** from `aiesec`/
+`convocatorias`, even though all three use the same bot/token — a Telegram
+bot's DM with a given user is always the same single chat, so the simplest
+way to get a second, separate destination for the same bot is a small
+Telegram group with just you + the bot in it (group chat_ids are negative
+numbers), used only for `getonboard` notifications:
+
+1. In the Telegram app, create a new group (New Message -> New Group), add
+   no other members, and give it any name (e.g. "Get on Board jobs").
+2. Add the existing bot to that group the same way you'd add a person:
+   search for its username and add it as a member.
+3. Send any message in the group (e.g. "hi").
+4. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and
+   find that message's update — its `"chat": {"id": ...}` is the group's
+   `chat_id` (negative, e.g. `-123456789`). Use that value in the
+   `insert into notification_channels ... ('getonboard', '<chat id>')`
+   above.
 
 ### 4. Convocatorias keywords
 
@@ -166,6 +208,8 @@ places.
   it (add a regex if it's a new bit of markup), then add one entry to
   `FIELD_EXTRACTORS` mapping a column name to a function that turns that raw
   string into a typed value.
+- **Get on Board**: same as convocatorias, but in `_parse_card` instead of
+  `_parse_article`.
 
 Either way, you'll still need to add the matching database columns: a plain
 column on the snapshot table, and a `current_<field>` column on the dim
@@ -197,3 +241,14 @@ returning 0 rows, or every field comes back `None`, the fastest way to fix
 it is to open `/convocatorias/` in a browser, inspect one `<article
 class="card">` element, and adjust the regexes in `_parse_article` and the
 module-level `*_RE` patterns to match the new markup.
+
+## If getonbrd.com.pe's markup changes
+
+`getonboard_client.py`'s regexes are tied to that site's current HTML
+(class names like `results-item`, `results-list-title`, `location`, the
+`icon-money-bill` badge, and the `opacity-half size0` posted-date div). If
+that source's run starts returning 0 rows, or every field comes back
+`None`, open `https://www.getonbrd.com.pe/jobs/tag/data-engineer` in a
+browser, inspect one `<a class="results-item">` card, and adjust the
+regexes in `_parse_card` and the module-level `*_RE` patterns to match the
+new markup.

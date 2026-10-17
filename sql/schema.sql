@@ -114,6 +114,57 @@ create table convocatoria_keywords (
 );
 
 -- ============================================================
+-- Source: Get on Board (scripts/getonboard_client.py)
+-- Scraped from getonbrd.com.pe's public job-tag listing page. There's no
+-- numeric id in the listing HTML, so `id` is the job's URL path. Only one
+-- tag is fetched for now ("data-engineer", hardcoded in the client), not a
+-- configurable table like convocatoria_keywords.
+-- ============================================================
+
+create table getonboard_snapshot (
+  run_date date not null,
+  id text not null,
+  titulo text,
+  empresa text,
+  ubicacion text,
+  tipo_empleo text,
+  categoria text,
+  salario text,
+  fecha_publicacion date,
+  url text,
+  primary key (run_date, id)
+);
+
+create table getonboard_dim (
+  id text primary key,
+  first_seen_at timestamptz not null,
+  last_seen_at timestamptz not null,
+  is_active boolean not null default true,
+  times_seen integer not null default 1,
+  current_titulo text,
+  current_empresa text,
+  current_ubicacion text,
+  current_tipo_empleo text,
+  current_categoria text,
+  current_salario text,
+  current_fecha_publicacion date,
+  current_url text
+);
+
+create table getonboard_events (
+  event_id bigint generated always as identity primary key,
+  getonboard_id text not null,
+  event_type text not null check (event_type in ('created', 'updated', 'closed', 'reopened')),
+  event_at timestamptz not null default now(),
+  field text,
+  old_value text,
+  new_value text
+);
+
+create index on getonboard_snapshot (id);
+create index on getonboard_events (getonboard_id);
+
+-- ============================================================
 -- Shared across sources
 -- ============================================================
 
@@ -142,5 +193,6 @@ create table notification_channels (
 -- Also create a Storage bucket named "raw-snapshots" (Storage tab in the
 -- Supabase dashboard, or SQL: select storage.create_bucket('raw-snapshots')
 -- depending on your project version). Each source archives its raw fetch
--- under its own prefix: raw-snapshots/aiesec/{date}.json and
--- raw-snapshots/convocatorias/{date}.json.
+-- under its own prefix: raw-snapshots/aiesec/{date}.json,
+-- raw-snapshots/convocatorias/{date}.json, and
+-- raw-snapshots/getonboard/{date}.json.

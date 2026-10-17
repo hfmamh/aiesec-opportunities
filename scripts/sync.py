@@ -5,11 +5,13 @@ import time
 
 import aiesec_client
 import convocatorias_client
+import getonboard_client
 import notifier
 from supabase_client import get_client
 
 AIESEC_TRACKED_FIELDS = list(aiesec_client.FIELD_EXTRACTORS.keys())
 CONVOCATORIAS_TRACKED_FIELDS = list(convocatorias_client.FIELD_EXTRACTORS.keys())
+GETONBOARD_TRACKED_FIELDS = list(getonboard_client.FIELD_EXTRACTORS.keys())
 
 
 def start_run(client, source):
@@ -214,6 +216,25 @@ def run_convocatorias(client):
     return len(rows), len(raw_pages), created_rows
 
 
+def run_getonboard(client):
+    """Fetches, archives, snapshots and diffs today's Get on Board listings
+    for the "data-engineer" tag. Same return/raise contract as run_aiesec."""
+    today = datetime.date.today().isoformat()
+    raw_pages, rows = getonboard_client.fetch_all()
+
+    archive_raw(client, "getonboard", today, raw_pages)
+    upsert_snapshot(client, "getonboard_snapshot", today, rows)
+    created, updated, closed, reopened, created_rows = diff_and_upsert_dim(
+        client, "getonboard_dim", "getonboard_events", "getonboard_id",
+        GETONBOARD_TRACKED_FIELDS, today, rows,
+    )
+    print(
+        f"[getonboard] OK: {len(rows)} listings across {len(raw_pages)} pages "
+        f"(+{created} created, {updated} updated, {closed} closed, {reopened} reopened)"
+    )
+    return len(rows), len(raw_pages), created_rows
+
+
 def run_source(client, source, run_fn, notify_fn):
     """Wraps one source's run_fn with ingestion_runs bookkeeping and a
     best-effort Telegram notification. A failure here is caught and reported
@@ -232,15 +253,16 @@ def run_source(client, source, run_fn, notify_fn):
         finish_run(client, run_id, "failed", duration_ms=duration_ms, error=str(exc)[:2000])
         raise
 
-    # Ingestion already succeeded and was recorded at this point. A Telegram
-    # failure (missing secrets, API hiccup, etc.) is logged but must not be
-    # treated as a pipeline failure, since the data sync worked.
+    # Ingestion already succeeded and was recorded at this point. A
+    # notify_fn failure (missing secrets, API hiccup, etc.) is logged but
+    # must not be treated as a pipeline failure, since the data sync
+    # already worked.
     if created_rows:
         try:
             notify_fn(client, created_rows)
-            print(f"[{source}] Notified Telegram: {len(created_rows)} new items")
+            print(f"[{source}] Ran notify_fn for {len(created_rows)} new items")
         except Exception as exc:
-            print(f"[{source}] WARNING: Telegram notification failed: {exc}", file=sys.stderr)
+            print(f"[{source}] WARNING: notify_fn failed: {exc}", file=sys.stderr)
 
 
 def main():
@@ -249,6 +271,7 @@ def main():
     sources = [
         ("aiesec", run_aiesec, notifier.notify_new_opportunities),
         ("convocatorias", run_convocatorias, notifier.notify_new_convocatorias),
+        ("getonboard", run_getonboard, notifier.notify_new_getonboard),
     ]
 
     failures = []

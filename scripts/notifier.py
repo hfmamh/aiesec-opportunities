@@ -246,3 +246,68 @@ def notify_new_convocatorias(client, rows):
     count = len(rows)
     blocks = [_format_convocatoria(row, i) for i, row in enumerate(rows, start=1)]
     _send_grouped(chat_id, lambda i, total: _convocatorias_header(count, i, total), blocks)
+
+
+# ============================================================
+# Get on Board (personal Data Engineer job search)
+# ============================================================
+
+def _format_getonboard(row, index):
+    titulo = html.escape(row.get("titulo") or "Vacante sin título")
+    empresa = html.escape(row.get("empresa") or "Empresa desconocida")
+    ubicacion = row.get("ubicacion")
+    place = html.escape(str(ubicacion)) if ubicacion else ""
+
+    lines = [f"{index}. <b>{titulo}</b>"]
+    meta = f"<i>{empresa}</i>"
+    if place:
+        meta += f" — <i>{place}</i>"
+    lines.append(meta)
+
+    details = []
+    tipo_empleo = row.get("tipo_empleo")
+    if tipo_empleo:
+        details.append(html.escape(str(tipo_empleo)))
+    categoria = row.get("categoria")
+    if categoria:
+        details.append(html.escape(str(categoria)))
+    if details:
+        lines.append(" · ".join(details))
+
+    salario = row.get("salario")
+    if salario:
+        lines.append(f"\U0001f4b0 {html.escape(str(salario))}")
+
+    fecha_publicacion = row.get("fecha_publicacion")
+    if fecha_publicacion:
+        lines.append(f"\U0001f4c5 Publicada {html.escape(str(fecha_publicacion))}")
+
+    url = row.get("url")
+    if url:
+        lines.append(f'<a href="{html.escape(url)}">Ver vacante →</a>')
+
+    return "\n".join(lines)
+
+
+def _getonboard_header(count, chunk_index, chunk_count):
+    noun = "nueva vacante" if count == 1 else "nuevas vacantes"
+    header = f"<b>\U0001f527 {count} {noun} de Data Engineer en Get on Board</b>"
+    if chunk_count > 1:
+        header += f" ({chunk_index}/{chunk_count})"
+    return header
+
+
+def notify_new_getonboard(client, rows):
+    """Sends one or more grouped summary messages (chunked to Telegram's
+    character limit) for newly created Get on Board listings, to whatever
+    chat notification_channels has configured for source='getonboard'
+    (intentionally a different chat from 'aiesec'/'convocatorias' — this is
+    the user's personal Data Engineer job search, not an AIESEC/convocatorias
+    opportunity, and the user doesn't want the two mixed in one conversation).
+    Same no-op/raise contract as notify_new_opportunities."""
+    if not rows:
+        return
+    chat_id = chat_id_for_source(client, "getonboard")
+    count = len(rows)
+    blocks = [_format_getonboard(row, i) for i, row in enumerate(rows, start=1)]
+    _send_grouped(chat_id, lambda i, total: _getonboard_header(count, i, total), blocks)
