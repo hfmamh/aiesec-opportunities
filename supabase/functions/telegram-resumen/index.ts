@@ -82,6 +82,8 @@ interface SourceConfig {
   dateLabel: string; // verb phrase, e.g. "cierra" / "publicada"
   dateAbsentLabel: string; // e.g. "sin fecha de cierre"
   highlightTitles?: string[]; // exact-title highlight, e.g. convocatorias' Biólogo/Bióloga
+  urlField: string | null; // dim column already holding a full URL, if any
+  buildUrl?: (id: string) => string; // for sources with no url column (AIESEC)
 }
 
 function buildSelectFields(cfg: Omit<SourceConfig, "selectFields">): string {
@@ -90,7 +92,19 @@ function buildSelectFields(cfg: Omit<SourceConfig, "selectFields">): string {
   if (cfg.salaryField) cols.push(cfg.salaryField);
   if (cfg.salaryCurrencyField) cols.push(cfg.salaryCurrencyField);
   if (cfg.dateField) cols.push(cfg.dateField);
+  if (cfg.urlField) cols.push(cfg.urlField);
   return cols.join(", ");
+}
+
+function resolveUrl(cfg: SourceConfig, row: SourceRow): string | null {
+  if (cfg.urlField) {
+    return (row[cfg.urlField] as string | null) ?? null;
+  }
+  if (cfg.buildUrl) {
+    const id = row.id as string | undefined;
+    return id ? cfg.buildUrl(id) : null;
+  }
+  return null;
 }
 
 function defineSource(cfg: Omit<SourceConfig, "selectFields">): SourceConfig {
@@ -117,6 +131,7 @@ const SOURCES: Record<SourceKey, SourceConfig> = {
     dateLabel: "cierra",
     dateAbsentLabel: "sin fecha de cierre",
     highlightTitles: ["Biólogo", "Bióloga"],
+    urlField: "current_url",
   }),
   aiesec: defineSource({
     key: "aiesec",
@@ -136,6 +151,8 @@ const SOURCES: Record<SourceKey, SourceConfig> = {
     dateField: null,
     dateLabel: "",
     dateAbsentLabel: "",
+    urlField: null,
+    buildUrl: (id) => `https://aiesec.org/opportunity/global-talent/${id}`,
   }),
   getonboard: defineSource({
     key: "getonboard",
@@ -155,6 +172,7 @@ const SOURCES: Record<SourceKey, SourceConfig> = {
     dateField: "current_fecha_publicacion",
     dateLabel: "publicada",
     dateAbsentLabel: "sin fecha de publicación",
+    urlField: "current_url",
   }),
 };
 
@@ -296,6 +314,11 @@ function formatRowLine(cfg: SourceConfig, row: SourceRow): string {
     line += date ? ` (${cfg.dateLabel} ${date})` : ` (${cfg.dateAbsentLabel})`;
   }
 
+  const url = resolveUrl(cfg, row);
+  if (url) {
+    line += ` — enlace: ${url}`;
+  }
+
   return line;
 }
 
@@ -322,7 +345,8 @@ function buildPrompt(cfg: SourceConfig, nuevas: SourceRow[], activas: SourceRow[
   return [
     `Eres un asistente que resume ${cfg.label} para enviarlas por Telegram, con un`,
     "estilo dinámico (negritas con emojis, no texto plano). Te doy dos listas ya",
-    "filtradas, cada fila con los datos que tiene disponibles.",
+    "filtradas, cada fila con los datos que tiene disponibles, incluyendo su",
+    "enlace ('— enlace: URL') cuando existe.",
     "",
     "FORMATO DE SALIDA (obligatorio):",
     "- Usa SOLO HTML válido de Telegram: <b>negrita</b> e <i>cursiva</i>.",
@@ -331,7 +355,12 @@ function buildPrompt(cfg: SourceConfig, nuevas: SourceRow[], activas: SourceRow[
     salaryInstruction,
     dateInstruction,
     highlightInstruction,
-    "- Sé EJECUTIVO y MUY CORTO: máximo ~90 palabras en total. Nada de saludos,",
+    "- Todo resultado que menciones explícitamente (destacado por sueldo, por",
+    "  título, o cualquier otro) debe llevar su enlace como HTML:",
+    "  <a href=\"URL exacta de 'enlace'\">Ver</a> pegado al nombre del resultado.",
+    "  Nunca muestres la URL como texto plano ni la inventes si no viene en los datos.",
+    "- Sé EJECUTIVO y MUY CORTO: máximo ~90 palabras visibles en total (el texto",
+    "  de los enlaces, ej. 'Ver', no cuenta para el límite). Nada de saludos,",
     "  despedidas, ni relleno — solo los datos clave, en el menor número de palabras posible.",
     "",
     `Nuevas esta semana (${nuevas.length}):`,
@@ -566,7 +595,10 @@ function qaSystemPreamble(cfg: SourceConfig): string {
     "función, si la llamaste), usa SOLO HTML válido de Telegram",
     "(<b>negrita</b>, <i>cursiva</i>; nunca markdown de asteriscos ni",
     "encabezados #), sé breve y directo, y usa 💰 para sueldos y 📅 para",
-    "fechas cuando corresponda.",
+    "fechas cuando corresponda. Cada resultado que los datos de la función",
+    "incluyan con '— enlace: URL' y que menciones en tu respuesta debe llevar",
+    "ese enlace como HTML (<a href=\"URL exacta\">Ver</a> pegado al nombre) —",
+    "nunca como texto plano ni inventado.",
   ].join("\n");
 }
 
