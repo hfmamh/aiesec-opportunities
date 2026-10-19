@@ -1,17 +1,23 @@
 // Supabase Edge Function: telegram-resumen
 //
 // Webhook target for Telegram's getUpdates push (setWebhook), handling:
-//   - `/resumen`: a fixed, hardcoded-query summary (see buildPrompt below).
-//   - any other non-slash text: a free-form natural-language question,
-//     answered via Gemini function calling against a small fixed set of
-//     safe, parameterized Supabase queries (never raw/model-written SQL —
-//     see TOOLS/runTool below).
-// Both reply in real time with Gemini-generated text about convocatorias
-// del Estado peruano — the only source wired up so far (not AIESEC, not Get
-// on Board). Everything else (the 4h cron sync in scripts/sync.py, its own
-// Telegram notifications via scripts/notifier.py) is untouched; this is a
-// separate, always-on entry point that lives only here under
-// supabase/functions/.
+//   - `/usar_aiesec`, `/usar_convocatorias`, `/usar_getonboard`: sets this
+//     chat's *active source* (persisted in telegram_bot_sessions), sticky
+//     until changed again.
+//   - `/resumen`: a fixed, hardcoded-query summary of the chat's active
+//     source (see buildPrompt below). Replies asking to pick a source first
+//     if none is set yet.
+//   - any other non-slash text: a free-form natural-language question about
+//     the chat's active source, answered via Gemini function calling
+//     against a small fixed set of safe, parameterized Supabase queries
+//     (never raw/model-written SQL — see TOOLS/runTool below).
+// All three sources (AIESEC opportunities, convocatorias del Estado
+// peruano, Get on Board) are supported identically through the SourceConfig
+// below — adding a fourth source means adding one config entry, not new
+// handler code. Everything else (the 4h cron sync in scripts/sync.py, its
+// own Telegram notifications via scripts/notifier.py, which push to three
+// separate per-source broadcast channels) is untouched; this is a separate,
+// always-on entry point that lives only here under supabase/functions/.
 //
 // Required secrets (set via `supabase secrets set` / the dashboard, never
 // committed):
@@ -25,6 +31,8 @@
 //     .googleapis.com), free tier.
 // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are injected automatically into
 // every Edge Function's environment — no secret to set for those.
+//
+// Requires the telegram_bot_sessions table (sql/migrations/0006_add_telegram_bot_sessions.sql).
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -32,10 +40,10 @@ const TELEGRAM_API_BASE = "https://api.telegram.org";
 const GEMINI_MODEL = "gemini-flash-lite-latest";
 const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
-// Safety cap on how many "currently active" convocatorias go into the
-// Gemini prompt. The keyword-scoped scrape (convocatoria_keywords, see
-// sql/schema.sql) keeps this small in practice, but this guards against a
-// broad keyword set ever blowing up the prompt size / token cost.
+// Safety cap on how many "currently active" rows go into the Gemini
+// digest prompt. Keyword-scoped sources (convocatorias) keep this small in
+// practice, but this guards against a broad keyword set or an unfiltered
+// source ever blowing up the prompt size / token cost.
 const MAX_ACTIVE_ROWS = 40;
 
 // Same idea, for the free-question tool-calling flow: a hard server-side
@@ -48,17 +56,113 @@ const MAX_QUERY_ROWS = 30;
 // calls per question, bounded so a confused model can't loop forever.
 const MAX_TOOL_ROUNDS = 3;
 
-interface ConvocatoriaRow {
-  id: string;
-  current_titulo: string | null;
-  current_entidad: string | null;
-  current_fecha_cierre: string | null;
-  current_departamento: string | null;
-  current_sueldo: number | null;
+type SourceKey = "aiesec" | "convocatorias" | "getonboard";
+
+// Generic row shape — each source's dim table has different columns,
+// accessed dynamically through the field names in SourceConfig below.
+type SourceRow = Record<string, unknown>;
+
+interface SourceConfig {
+  key: SourceKey;
+  label: string; // Spanish, used in prompts and user-facing replies
+  dimTable: string;
+  eventsTable: string;
+  eventIdColumn: string; // e.g. "convocatoria_id" in convocatoria_events
+  selectFields: string; // computed below from the fields listed here
+  titleField: string;
+  orgField: string;
+  orgLabel: string; // Spanish noun for orgField, e.g. "entidad" / "empresa"
+  placeField: string | null;
+  placeLabel: string; // e.g. "departamento" / "país" / "ubicación"
+  salaryField: string | null;
+  salaryIsNumeric: boolean;
+  salaryCurrencyField: string | null; // e.g. AIESEC's current_salary_currency
+  salaryStaticPrefix: string | null; // e.g. convocatorias' flat "S/"
+  dateField: string | null;
+  dateLabel: string; // verb phrase, e.g. "cierra" / "publicada"
+  dateAbsentLabel: string; // e.g. "sin fecha de cierre"
+  highlightTitles?: string[]; // exact-title highlight, e.g. convocatorias' Biólogo/Bióloga
 }
 
-const SELECT_FIELDS =
-  "id, current_titulo, current_entidad, current_fecha_cierre, current_departamento, current_sueldo";
+function buildSelectFields(cfg: Omit<SourceConfig, "selectFields">): string {
+  const cols = ["id", cfg.titleField, cfg.orgField];
+  if (cfg.placeField) cols.push(cfg.placeField);
+  if (cfg.salaryField) cols.push(cfg.salaryField);
+  if (cfg.salaryCurrencyField) cols.push(cfg.salaryCurrencyField);
+  if (cfg.dateField) cols.push(cfg.dateField);
+  return cols.join(", ");
+}
+
+function defineSource(cfg: Omit<SourceConfig, "selectFields">): SourceConfig {
+  return { ...cfg, selectFields: buildSelectFields(cfg) };
+}
+
+const SOURCES: Record<SourceKey, SourceConfig> = {
+  convocatorias: defineSource({
+    key: "convocatorias",
+    label: "convocatorias del Estado peruano",
+    dimTable: "convocatorias_dim",
+    eventsTable: "convocatoria_events",
+    eventIdColumn: "convocatoria_id",
+    titleField: "current_titulo",
+    orgField: "current_entidad",
+    orgLabel: "entidad",
+    placeField: "current_departamento",
+    placeLabel: "departamento",
+    salaryField: "current_sueldo",
+    salaryIsNumeric: true,
+    salaryCurrencyField: null,
+    salaryStaticPrefix: "S/",
+    dateField: "current_fecha_cierre",
+    dateLabel: "cierra",
+    dateAbsentLabel: "sin fecha de cierre",
+    highlightTitles: ["Biólogo", "Bióloga"],
+  }),
+  aiesec: defineSource({
+    key: "aiesec",
+    label: "oportunidades AIESEC",
+    dimTable: "opportunities_dim",
+    eventsTable: "opportunity_events",
+    eventIdColumn: "opportunity_id",
+    titleField: "current_title",
+    orgField: "current_company",
+    orgLabel: "empresa",
+    placeField: "current_country",
+    placeLabel: "país",
+    salaryField: "current_salary",
+    salaryIsNumeric: true,
+    salaryCurrencyField: "current_salary_currency",
+    salaryStaticPrefix: null,
+    dateField: null,
+    dateLabel: "",
+    dateAbsentLabel: "",
+  }),
+  getonboard: defineSource({
+    key: "getonboard",
+    label: "vacantes de Data Engineer en Get on Board",
+    dimTable: "getonboard_dim",
+    eventsTable: "getonboard_events",
+    eventIdColumn: "getonboard_id",
+    titleField: "current_titulo",
+    orgField: "current_empresa",
+    orgLabel: "empresa",
+    placeField: "current_ubicacion",
+    placeLabel: "ubicación",
+    salaryField: "current_salario",
+    salaryIsNumeric: false, // free text (e.g. "S/ 4,000 - 6,000"), not sortable
+    salaryCurrencyField: null,
+    salaryStaticPrefix: null,
+    dateField: "current_fecha_publicacion",
+    dateLabel: "publicada",
+    dateAbsentLabel: "sin fecha de publicación",
+  }),
+};
+
+const SOURCE_KEYS = Object.keys(SOURCES) as SourceKey[];
+
+function isSourceKey(value: string): value is SourceKey {
+  return (SOURCE_KEYS as string[]).includes(value);
+}
 
 function supabaseAdminClient() {
   const url = Deno.env.get("SUPABASE_URL");
@@ -69,107 +173,173 @@ function supabaseAdminClient() {
   return createClient(url, key);
 }
 
+// ============================================================
+// Per-chat active source (telegram_bot_sessions)
+// ============================================================
+
+async function getActiveSource(
+  supabase: ReturnType<typeof createClient>,
+  chatId: number | string,
+): Promise<SourceKey | null> {
+  const { data, error } = await supabase
+    .from("telegram_bot_sessions")
+    .select("active_source")
+    .eq("chat_id", String(chatId))
+    .maybeSingle();
+  if (error) {
+    throw new Error(`telegram_bot_sessions lookup failed: ${error.message}`);
+  }
+  const value = data?.active_source as string | undefined;
+  return value && isSourceKey(value) ? value : null;
+}
+
+async function setActiveSource(
+  supabase: ReturnType<typeof createClient>,
+  chatId: number | string,
+  source: SourceKey,
+): Promise<void> {
+  const { error } = await supabase
+    .from("telegram_bot_sessions")
+    .upsert({ chat_id: String(chatId), active_source: source, updated_at: new Date().toISOString() });
+  if (error) {
+    throw new Error(`telegram_bot_sessions upsert failed: ${error.message}`);
+  }
+}
+
+// ============================================================
+// Generic per-source queries
+// ============================================================
+
 async function fetchRecientes(
   supabase: ReturnType<typeof createClient>,
+  cfg: SourceConfig,
   dias: number,
-): Promise<ConvocatoriaRow[]> {
+): Promise<SourceRow[]> {
   const since = new Date(Date.now() - dias * 24 * 60 * 60 * 1000).toISOString();
 
   const { data: events, error: eventsError } = await supabase
-    .from("convocatoria_events")
-    .select("convocatoria_id")
+    .from(cfg.eventsTable)
+    .select(cfg.eventIdColumn)
     .eq("event_type", "created")
     .gte("event_at", since);
   if (eventsError) {
-    throw new Error(`convocatoria_events query failed: ${eventsError.message}`);
+    throw new Error(`${cfg.eventsTable} query failed: ${eventsError.message}`);
   }
 
-  const ids = [...new Set((events ?? []).map((row) => row.convocatoria_id as string))];
+  const ids = [...new Set((events ?? []).map((row) => (row as SourceRow)[cfg.eventIdColumn] as string))];
   if (ids.length === 0) {
     return [];
   }
 
   const { data: rows, error: dimError } = await supabase
-    .from("convocatorias_dim")
-    .select(SELECT_FIELDS)
+    .from(cfg.dimTable)
+    .select(cfg.selectFields)
     .in("id", ids)
     .limit(MAX_QUERY_ROWS);
   if (dimError) {
-    throw new Error(`convocatorias_dim query (recientes) failed: ${dimError.message}`);
+    throw new Error(`${cfg.dimTable} query (recientes) failed: ${dimError.message}`);
   }
-  return (rows ?? []) as ConvocatoriaRow[];
+  return (rows ?? []) as SourceRow[];
 }
 
-const fetchNuevasEstaSemana = (supabase: ReturnType<typeof createClient>) => fetchRecientes(supabase, 7);
+const fetchNuevasEstaSemana = (supabase: ReturnType<typeof createClient>, cfg: SourceConfig) =>
+  fetchRecientes(supabase, cfg, 7);
 
 async function fetchActivas(
   supabase: ReturnType<typeof createClient>,
-): Promise<ConvocatoriaRow[]> {
-  const { data: rows, error } = await supabase
-    .from("convocatorias_dim")
-    .select(SELECT_FIELDS)
-    .eq("is_active", true)
-    .order("current_sueldo", { ascending: false, nullsFirst: false })
-    .limit(MAX_ACTIVE_ROWS);
-  if (error) {
-    throw new Error(`convocatorias_dim query (activas) failed: ${error.message}`);
+  cfg: SourceConfig,
+): Promise<SourceRow[]> {
+  let query = supabase.from(cfg.dimTable).select(cfg.selectFields).eq("is_active", true);
+  if (cfg.salaryField) {
+    query = query.order(cfg.salaryField, { ascending: false, nullsFirst: false });
+  } else if (cfg.dateField) {
+    query = query.order(cfg.dateField, { ascending: false, nullsFirst: false });
   }
-  return (rows ?? []) as ConvocatoriaRow[];
+  query = query.limit(MAX_ACTIVE_ROWS);
+
+  const { data, error } = await query;
+  if (error) {
+    throw new Error(`${cfg.dimTable} query (activas) failed: ${error.message}`);
+  }
+  return (data ?? []) as SourceRow[];
 }
 
-function formatRowLine(row: ConvocatoriaRow): string {
-  const titulo = row.current_titulo || "Convocatoria sin título";
-  const entidad = row.current_entidad || "Entidad desconocida";
-  const depto = row.current_departamento || "Departamento no especificado";
-  const cierre = row.current_fecha_cierre ? `cierra ${row.current_fecha_cierre}` : "sin fecha de cierre";
-  const sueldo = row.current_sueldo ? `S/ ${row.current_sueldo.toLocaleString("es-PE")}` : "sin sueldo listado";
-  return `- ${titulo} — ${entidad} — depto: ${depto} — ${sueldo} (${cierre})`;
+function formatRowLine(cfg: SourceConfig, row: SourceRow): string {
+  const titulo = (row[cfg.titleField] as string) || "Sin título";
+  const org = (row[cfg.orgField] as string) || `${cfg.orgLabel} desconocida`;
+  let line = `- ${titulo} — ${org}`;
+
+  if (cfg.placeField) {
+    const place = row[cfg.placeField] as string | null;
+    line += place ? ` — ${place}` : ` — ${cfg.placeLabel} no especificado`;
+  }
+
+  if (cfg.salaryField) {
+    const salary = row[cfg.salaryField];
+    if (salary !== null && salary !== undefined && salary !== "") {
+      if (cfg.salaryIsNumeric) {
+        const amount = Number(salary).toLocaleString("es-PE");
+        const currency = cfg.salaryCurrencyField
+          ? ((row[cfg.salaryCurrencyField] as string | null) ?? "")
+          : (cfg.salaryStaticPrefix ?? "");
+        line += ` — ${currency ? `${currency} ${amount}` : amount}`;
+      } else {
+        line += ` — ${String(salary)}`;
+      }
+    } else {
+      line += " — sin sueldo listado";
+    }
+  }
+
+  if (cfg.dateField) {
+    const date = row[cfg.dateField];
+    line += date ? ` (${cfg.dateLabel} ${date})` : ` (${cfg.dateAbsentLabel})`;
+  }
+
+  return line;
 }
 
-function buildPrompt(nuevas: ConvocatoriaRow[], activas: ConvocatoriaRow[]): string {
-  const nuevasBlock = nuevas.length > 0
-    ? nuevas.map(formatRowLine).join("\n")
-    : "(ninguna)";
-  const activasBlock = activas.length > 0
-    ? activas.map(formatRowLine).join("\n")
-    : "(ninguna)";
+function buildPrompt(cfg: SourceConfig, nuevas: SourceRow[], activas: SourceRow[]): string {
+  const nuevasBlock = nuevas.length > 0 ? nuevas.map((r) => formatRowLine(cfg, r)).join("\n") : "(ninguna)";
+  const activasBlock = activas.length > 0 ? activas.map((r) => formatRowLine(cfg, r)).join("\n") : "(ninguna)";
+
+  const placeInstruction = cfg.placeField
+    ? `- Agrupa por ${cfg.placeLabel} (como máximo 3 grupos, los más representativos) y da el conteo total por ${cfg.orgLabel} dentro de cada grupo (ej. '3 en Essalud'), no listes cada resultado individualmente.`
+    : `- Agrupa por ${cfg.orgLabel} y da el conteo total (ej. '3 en Essalud'), no listes cada resultado individualmente.`;
+
+  const salaryInstruction = cfg.salaryField && cfg.salaryIsNumeric
+    ? "- Resalta en <b>negrita</b> específicamente el resultado con el sueldo más alto de cada grupo (si hay datos de sueldo), con el emoji 💰 antes del monto."
+    : "";
+
+  const dateInstruction = cfg.dateField
+    ? `- Usa 📅 para mencionar la fecha (${cfg.dateLabel}) solo de los resultados destacados.`
+    : "";
+
+  const highlightInstruction = cfg.highlightTitles && cfg.highlightTitles.length > 0
+    ? `- Además, destaca SIEMPRE en <b>negrita</b> con el emoji 🧬 los resultados cuyo título sea NETAMENTE uno de: ${cfg.highlightTitles.join(", ")} (el cargo exacto, sin calificativos como 'técnico', 'analista', 'asistente', 'especialista' u otros) — esto aplica aparte del resaltado por sueldo, incluso si no es el de mayor sueldo.`
+    : "";
 
   return [
-    "Eres un asistente que resume convocatorias laborales del Estado peruano",
-    "para enviarlas por Telegram, con el mismo estilo dinámico que usan los",
-    "mensajes automáticos de este canal (negritas con emojis, no texto",
-    "plano). Te doy dos listas ya filtradas por los temas de interés del",
-    "usuario, cada fila con su departamento y sueldo (si existe).",
+    `Eres un asistente que resume ${cfg.label} para enviarlas por Telegram, con un`,
+    "estilo dinámico (negritas con emojis, no texto plano). Te doy dos listas ya",
+    "filtradas, cada fila con los datos que tiene disponibles.",
     "",
     "FORMATO DE SALIDA (obligatorio):",
     "- Usa SOLO HTML válido de Telegram: <b>negrita</b> e <i>cursiva</i>.",
     "  Nunca uses markdown de asteriscos (**texto**) ni encabezados #.",
-    "- Dos párrafos, cada uno con un emoji de encabezado:",
-    "  '🏙️ <b>Lima</b>' para convocatorias cuyo departamento sea Lima",
-    "  (incluye Callao/Lima Metropolitana), y",
-    "  '🗺️ <b>Provincias</b>' para todo el resto. Si un párrafo no tiene",
-    "  nada que mostrar, omítelo por completo.",
-    "- Dentro de cada párrafo, agrupa por entidad y da el conteo total",
-    "  (ej. '3 en MINSA'), no listes cada convocatoria individualmente.",
-    "- Resalta en <b>negrita</b> específicamente la(s) convocatoria(s) con",
-    "  el sueldo más alto de cada párrafo, con el emoji 💰 antes del monto",
-    "  (ej. '💰 <b>S/ 5,500</b> en Essalud').",
-    "- Usa 📅 para mencionar fechas de cierre solo de las destacadas.",
-    "- Además, destaca SIEMPRE en <b>negrita</b> con el emoji 🧬 las",
-    "  convocatorias cuyo título sea NETAMENTE 'Biólogo' o 'Bióloga' (el",
-    "  cargo exacto, sin calificativos como 'técnico', 'analista',",
-    "  'asistente', 'especialista' u otros) — esto aplica aparte del",
-    "  resaltado por sueldo, incluso si no es la de mayor sueldo.",
-    "- Sé EJECUTIVO y MUY CORTO: máximo ~90 palabras en total entre ambos",
-    "  párrafos. Nada de saludos, despedidas, ni relleno — solo los datos",
-    "  clave, en el menor número de palabras posible.",
+    placeInstruction,
+    salaryInstruction,
+    dateInstruction,
+    highlightInstruction,
+    "- Sé EJECUTIVO y MUY CORTO: máximo ~90 palabras en total. Nada de saludos,",
+    "  despedidas, ni relleno — solo los datos clave, en el menor número de palabras posible.",
     "",
     `Nuevas esta semana (${nuevas.length}):`,
     nuevasBlock,
     "",
     `Activas actualmente (${activas.length}):`,
     activasBlock,
-  ].join("\n");
+  ].filter((line) => line !== "").join("\n");
 }
 
 // Generic Gemini generateContent call, shared by the /resumen prompt-only
@@ -221,62 +391,73 @@ async function callGemini(prompt: string): Promise<string> {
 // ============================================================
 //
 // Any incoming message that isn't exactly "/resumen" (and doesn't start
-// with "/") is treated as a free-form question. Gemini calls the tools
-// below via function calling (up to MAX_TOOL_ROUNDS rounds) and each call
-// runs as a safe, parameterized supabase-js query — never raw or
-// model-written SQL — before Gemini writes the final answer.
+// with "/") is treated as a free-form question about the chat's active
+// source. Gemini calls the tools below via function calling (up to
+// MAX_TOOL_ROUNDS rounds) and each call runs as a safe, parameterized
+// supabase-js query — never raw or model-written SQL — before Gemini
+// writes the final answer. The tool set is built per-request from the
+// active source's config, so the same two tool names ("buscar",
+// "recientes") point at a different table depending on which source the
+// chat picked with /usar_*.
 
-const TOOLS = [
-  {
-    functionDeclarations: [
-      {
-        name: "buscar_convocatorias",
-        description:
-          "Busca convocatorias del Estado peruano (ya filtradas por los temas de interés configurados) por departamento y/o palabra clave en el título o la entidad convocante, ordenadas por sueldo o por fecha de cierre. Úsala para preguntas sobre qué hay disponible, en qué lugar, o cuál paga más / cierra más pronto.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            departamento: {
-              type: "STRING",
-              description: "Filtra por departamento/región del Perú, ej. 'Lima', 'Arequipa'. Omite para no filtrar por lugar.",
-            },
-            keyword: {
-              type: "STRING",
-              description: "Palabra o frase a buscar en el título del puesto o en la entidad convocante. Omite para no filtrar por palabra clave.",
-            },
-            solo_activas: {
-              type: "BOOLEAN",
-              description: "true (default) para solo convocatorias activas actualmente; false para incluir también las ya cerradas.",
-            },
-            orden: {
-              type: "STRING",
-              enum: ["sueldo_desc", "cierre_proximo"],
-              description: "Cómo ordenar los resultados: 'sueldo_desc' = mayor sueldo primero, 'cierre_proximo' = las que cierran más pronto primero.",
-            },
-            limite: {
-              type: "INTEGER",
-              description: `Máximo de resultados a traer (tope real ${MAX_QUERY_ROWS} sin importar lo que se pida).`,
+function buildTools(cfg: SourceConfig): unknown[] {
+  const ordenOptions: string[] = [];
+  if (cfg.salaryField && cfg.salaryIsNumeric) ordenOptions.push("sueldo_desc (mayor sueldo primero)");
+  if (cfg.dateField) {
+    ordenOptions.push("fecha_asc (la que vence/cierra antes, primero)");
+    ordenOptions.push("fecha_desc (la más reciente primero)");
+  }
+
+  const properties: Record<string, unknown> = {
+    keyword: {
+      type: "STRING",
+      description: `Palabra o frase a buscar en el título o en ${cfg.orgLabel}. Omite para no filtrar por palabra clave.`,
+    },
+    solo_activas: {
+      type: "BOOLEAN",
+      description: "true (default) para solo resultados activos actualmente; false para incluir también los ya cerrados.",
+    },
+    limite: {
+      type: "INTEGER",
+      description: `Máximo de resultados a traer (tope real ${MAX_QUERY_ROWS} sin importar lo que se pida).`,
+    },
+  };
+  if (cfg.placeField) {
+    properties.lugar = {
+      type: "STRING",
+      description: `Filtra por ${cfg.placeLabel}. Omite para no filtrar por lugar.`,
+    };
+  }
+  if (ordenOptions.length > 0) {
+    properties.orden = {
+      type: "STRING",
+      description: `Cómo ordenar los resultados: ${ordenOptions.join(", ")}.`,
+    };
+  }
+
+  return [
+    {
+      functionDeclarations: [
+        {
+          name: "buscar",
+          description:
+            `Busca ${cfg.label}${cfg.placeField ? ` por ${cfg.placeLabel} y/o` : ", filtrando por"} palabra clave en el título o en ${cfg.orgLabel}, ordenados según corresponda. Úsala para preguntas sobre qué hay disponible, en qué lugar, o cuál es mejor.`,
+          parameters: { type: "OBJECT", properties },
+        },
+        {
+          name: "recientes",
+          description: `Trae los resultados nuevos (recién publicados) de ${cfg.label} en los últimos N días. Úsala para preguntas sobre qué salió recientemente o esta semana.`,
+          parameters: {
+            type: "OBJECT",
+            properties: {
+              dias: { type: "INTEGER", description: "Cuántos días hacia atrás buscar. Default 7." },
             },
           },
         },
-      },
-      {
-        name: "convocatorias_recientes",
-        description:
-          "Trae las convocatorias nuevas (recién publicadas) en los últimos N días. Úsala para preguntas sobre qué salió recientemente o esta semana.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            dias: {
-              type: "INTEGER",
-              description: "Cuántos días hacia atrás buscar nuevas publicaciones. Default 7.",
-            },
-          },
-        },
-      },
-    ],
-  },
-];
+      ],
+    },
+  ];
+}
 
 // Strips PostgREST filter-syntax special characters (comma, parens, `*`,
 // `%`) from model-supplied filter values before interpolating them into a
@@ -307,32 +488,37 @@ function accentInsensitivePattern(value: string): string {
   return escaped.replace(/[aeiouAEIOUnN]/g, (ch) => ACCENT_CLASSES[ch] ?? ch);
 }
 
-async function runBuscarConvocatorias(
+async function runBuscar(
   supabase: ReturnType<typeof createClient>,
+  cfg: SourceConfig,
   args: Record<string, unknown>,
-): Promise<ConvocatoriaRow[]> {
-  let query = supabase.from("convocatorias_dim").select(SELECT_FIELDS);
+): Promise<SourceRow[]> {
+  let query = supabase.from(cfg.dimTable).select(cfg.selectFields);
 
   const soloActivas = args.solo_activas !== false; // default true
   if (soloActivas) {
     query = query.eq("is_active", true);
   }
 
-  const departamento = sanitizeFilterValue(args.departamento);
-  if (departamento) {
-    query = query.imatch("current_departamento", accentInsensitivePattern(departamento));
+  if (cfg.placeField) {
+    const lugar = sanitizeFilterValue(args.lugar);
+    if (lugar) {
+      query = query.imatch(cfg.placeField, accentInsensitivePattern(lugar));
+    }
   }
 
   const keyword = sanitizeFilterValue(args.keyword);
   if (keyword) {
     const pattern = accentInsensitivePattern(keyword);
-    query = query.or(`current_titulo.imatch.${pattern},current_entidad.imatch.${pattern}`);
+    query = query.or(`${cfg.titleField}.imatch.${pattern},${cfg.orgField}.imatch.${pattern}`);
   }
 
-  if (args.orden === "sueldo_desc") {
-    query = query.order("current_sueldo", { ascending: false, nullsFirst: false });
-  } else if (args.orden === "cierre_proximo") {
-    query = query.order("current_fecha_cierre", { ascending: true, nullsFirst: false });
+  if (args.orden === "sueldo_desc" && cfg.salaryField && cfg.salaryIsNumeric) {
+    query = query.order(cfg.salaryField, { ascending: false, nullsFirst: false });
+  } else if (args.orden === "fecha_asc" && cfg.dateField) {
+    query = query.order(cfg.dateField, { ascending: true, nullsFirst: false });
+  } else if (args.orden === "fecha_desc" && cfg.dateField) {
+    query = query.order(cfg.dateField, { ascending: false, nullsFirst: false });
   }
 
   const requestedLimit = typeof args.limite === "number" && args.limite > 0 ? Math.floor(args.limite) : MAX_QUERY_ROWS;
@@ -340,60 +526,68 @@ async function runBuscarConvocatorias(
 
   const { data, error } = await query;
   if (error) {
-    throw new Error(`buscar_convocatorias query failed: ${error.message}`);
+    throw new Error(`buscar (${cfg.key}) query failed: ${error.message}`);
   }
-  return (data ?? []) as ConvocatoriaRow[];
+  return (data ?? []) as SourceRow[];
 }
 
-async function runConvocatoriasRecientes(
+async function runRecientes(
   supabase: ReturnType<typeof createClient>,
+  cfg: SourceConfig,
   args: Record<string, unknown>,
-): Promise<ConvocatoriaRow[]> {
+): Promise<SourceRow[]> {
   const dias = typeof args.dias === "number" && args.dias > 0 ? Math.min(Math.floor(args.dias), 90) : 7;
-  return fetchRecientes(supabase, dias);
+  return fetchRecientes(supabase, cfg, dias);
 }
 
 async function runTool(
   supabase: ReturnType<typeof createClient>,
+  cfg: SourceConfig,
   name: string,
   args: Record<string, unknown>,
-): Promise<ConvocatoriaRow[]> {
-  if (name === "buscar_convocatorias") return runBuscarConvocatorias(supabase, args);
-  if (name === "convocatorias_recientes") return runConvocatoriasRecientes(supabase, args);
+): Promise<SourceRow[]> {
+  if (name === "buscar") return runBuscar(supabase, cfg, args);
+  if (name === "recientes") return runRecientes(supabase, cfg, args);
   throw new Error(`Unknown tool requested by Gemini: ${name}`);
 }
 
-const QA_SYSTEM_PREAMBLE = [
-  "Eres un asistente de Telegram sobre convocatorias laborales del Estado",
-  "peruano, ya filtradas por los temas de interés configurados (actualmente",
-  "biología). El usuario te hace una pregunta en lenguaje natural. Si la",
-  "pregunta necesita datos (buscar por lugar o palabra clave, ordenar por",
-  "sueldo o fecha de cierre, o ver qué salió recientemente), llama a la",
-  "función correspondiente — nunca inventes datos. Si la pregunta no tiene",
-  "que ver con estas convocatorias o no se puede responder con las",
-  "funciones disponibles, dilo brevemente y sugiere escribir /resumen para",
-  "un resumen general.",
-  "",
-  "Cuando redactes la respuesta final (después de ver el resultado de la",
-  "función, si la llamaste), usa SOLO HTML válido de Telegram",
-  "(<b>negrita</b>, <i>cursiva</i>; nunca markdown de asteriscos ni",
-  "encabezados #), sé breve y directo, y usa 💰 para sueldos y 📅 para",
-  "fechas de cierre cuando corresponda.",
-].join("\n");
+function qaSystemPreamble(cfg: SourceConfig): string {
+  return [
+    `Eres un asistente de Telegram sobre ${cfg.label}. El usuario te hace una`,
+    "pregunta en lenguaje natural. Si la pregunta necesita datos (buscar por",
+    "lugar o palabra clave, ordenar por sueldo o fecha, o ver qué salió",
+    "recientemente), llama a la función correspondiente — nunca inventes",
+    "datos. Si la pregunta no tiene que ver con esto o no se puede responder",
+    "con las funciones disponibles, dilo brevemente y sugiere /resumen, o",
+    "cambiar de fuente con /usar_aiesec, /usar_convocatorias o",
+    "/usar_getonboard.",
+    "",
+    "Cuando redactes la respuesta final (después de ver el resultado de la",
+    "función, si la llamaste), usa SOLO HTML válido de Telegram",
+    "(<b>negrita</b>, <i>cursiva</i>; nunca markdown de asteriscos ni",
+    "encabezados #), sé breve y directo, y usa 💰 para sueldos y 📅 para",
+    "fechas cuando corresponda.",
+  ].join("\n");
+}
 
-async function handleFreeQuestion(chatId: number | string, question: string): Promise<void> {
-  const supabase = supabaseAdminClient();
+async function handleFreeQuestion(
+  supabase: ReturnType<typeof createClient>,
+  cfg: SourceConfig,
+  chatId: number | string,
+  question: string,
+): Promise<void> {
+  const tools = buildTools(cfg);
 
   const contents: Record<string, unknown>[] = [
-    { role: "user", parts: [{ text: `${QA_SYSTEM_PREAMBLE}\n\nPregunta del usuario: ${question}` }] },
+    { role: "user", parts: [{ text: `${qaSystemPreamble(cfg)}\n\nPregunta del usuario: ${question}` }] },
   ];
 
   // Bounded tool loop: this model often wants several lookups (e.g. one
-  // filtered by Lima AND one unfiltered, emitted together, or a second
+  // filtered by a place AND one unfiltered, emitted together, or a second
   // search after seeing the first), so a single round left it without a
   // text answer. Each round executes every functionCall in the turn.
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const resp = await geminiGenerateContent(contents, TOOLS);
+    const resp = await geminiGenerateContent(contents, tools);
     const content = resp?.candidates?.[0]?.content;
     const parts: Record<string, unknown>[] = content?.parts ?? [];
     const calls = parts.filter((p) => p.functionCall);
@@ -414,8 +608,8 @@ async function handleFreeQuestion(chatId: number | string, question: string): Pr
       const { name, args, id } = p.functionCall as { name: string; args?: Record<string, unknown>; id?: string };
       let response: Record<string, unknown>;
       try {
-        const rows = await runTool(supabase, name, args ?? {});
-        response = { count: rows.length, resultados: rows.map(formatRowLine) };
+        const rows = await runTool(supabase, cfg, name, args ?? {});
+        response = { count: rows.length, resultados: rows.map((r) => formatRowLine(cfg, r)) };
       } catch (err) {
         console.error("telegram-resumen: tool execution failed", name, err);
         response = { error: err instanceof Error ? err.message : String(err) };
@@ -429,7 +623,7 @@ async function handleFreeQuestion(chatId: number | string, question: string): Pr
 
   // Out of rounds (or an empty turn): force a text answer from whatever
   // data has been gathered so far, so the user never gets a dead end.
-  const final = await geminiGenerateContent(contents, TOOLS, { functionCallingConfig: { mode: "NONE" } });
+  const final = await geminiGenerateContent(contents, tools, { functionCallingConfig: { mode: "NONE" } });
   const finalText = extractText(final?.candidates?.[0]?.content?.parts ?? []);
   if (!finalText) {
     console.error("telegram-resumen: no usable final text", JSON.stringify(final).slice(0, 500));
@@ -490,26 +684,30 @@ async function sendTelegramMessage(
   }
 }
 
-async function handleResumen(chatId: number | string): Promise<void> {
-  const supabase = supabaseAdminClient();
-
+async function handleResumen(
+  supabase: ReturnType<typeof createClient>,
+  cfg: SourceConfig,
+  chatId: number | string,
+): Promise<void> {
   const [nuevas, activas] = await Promise.all([
-    fetchNuevasEstaSemana(supabase),
-    fetchActivas(supabase),
+    fetchNuevasEstaSemana(supabase, cfg),
+    fetchActivas(supabase, cfg),
   ]);
 
   if (nuevas.length === 0 && activas.length === 0) {
     await sendTelegramMessage(
       chatId,
-      "No hay convocatorias nuevas esta semana ni activas en este momento.",
+      `No hay resultados nuevos esta semana ni activos en este momento para ${cfg.label}.`,
     );
     return;
   }
 
-  const prompt = buildPrompt(nuevas, activas);
+  const prompt = buildPrompt(cfg, nuevas, activas);
   const summary = await callGemini(prompt);
   await sendTelegramMessage(chatId, summary);
 }
+
+const USAR_COMMAND_PREFIX = "/usar_";
 
 Deno.serve(async (req: Request) => {
   try {
@@ -537,16 +735,10 @@ Deno.serve(async (req: Request) => {
     const chatId = chat?.id as number | string | undefined;
     const rawText = message?.text;
     const trimmedText = typeof rawText === "string" ? rawText.trim() : "";
-    const isResumenCommand = trimmedText.toLowerCase() === "/resumen";
+    const lowerText = trimmedText.toLowerCase();
 
     if (trimmedText === "") {
       // No text (e.g. a sticker/photo update) — nothing to do.
-      return new Response("ok", { status: 200 });
-    }
-
-    if (trimmedText.startsWith("/") && !isResumenCommand) {
-      // Any other bot command (e.g. /start) is ignored, not treated as a
-      // free-form question.
       return new Response("ok", { status: 200 });
     }
 
@@ -555,11 +747,46 @@ Deno.serve(async (req: Request) => {
       return new Response("ok", { status: 200 });
     }
 
+    const supabase = supabaseAdminClient();
+
     try {
-      if (isResumenCommand) {
-        await handleResumen(chatId);
+      if (lowerText.startsWith(USAR_COMMAND_PREFIX)) {
+        const candidate = lowerText.slice(USAR_COMMAND_PREFIX.length);
+        if (isSourceKey(candidate)) {
+          await setActiveSource(supabase, chatId, candidate);
+          await sendTelegramMessage(
+            chatId,
+            `Listo — ahora estás consultando <b>${SOURCES[candidate].label}</b>. Usa /resumen o pregúntame lo que quieras.`,
+          );
+        } else {
+          await sendTelegramMessage(
+            chatId,
+            "Fuente no reconocida. Usa /usar_aiesec, /usar_convocatorias o /usar_getonboard.",
+          );
+        }
+        return new Response("ok", { status: 200 });
+      }
+
+      if (lowerText.startsWith("/") && lowerText !== "/resumen") {
+        // Any other bot command (e.g. /start) is ignored, not treated as a
+        // free-form question.
+        return new Response("ok", { status: 200 });
+      }
+
+      const activeKey = await getActiveSource(supabase, chatId);
+      if (!activeKey) {
+        await sendTelegramMessage(
+          chatId,
+          "Primero elige una fuente: /usar_aiesec, /usar_convocatorias o /usar_getonboard.",
+        );
+        return new Response("ok", { status: 200 });
+      }
+      const cfg = SOURCES[activeKey];
+
+      if (lowerText === "/resumen") {
+        await handleResumen(supabase, cfg, chatId);
       } else {
-        await handleFreeQuestion(chatId, trimmedText);
+        await handleFreeQuestion(supabase, cfg, chatId, trimmedText);
       }
     } catch (err) {
       console.error("telegram-resumen: failed to handle update", err);

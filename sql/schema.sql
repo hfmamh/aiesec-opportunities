@@ -196,3 +196,13 @@ create table notification_channels (
 -- under its own prefix: raw-snapshots/aiesec/{date}.json,
 -- raw-snapshots/convocatorias/{date}.json, and
 -- raw-snapshots/getonboard/{date}.json.
+
+-- Per-chat state for the telegram-resumen Edge Function (supabase/functions/
+-- telegram-resumen): a chat picks an active source with /usar_aiesec,
+-- /usar_convocatorias or /usar_getonboard, and that choice persists until
+-- changed -- both /resumen and free-form questions in that chat use it.
+create table telegram_bot_sessions (
+  chat_id text primary key,
+  active_source text not null check (active_source in ('aiesec', 'convocatorias', 'getonboard')),
+  updated_at timestamptz not null default now()
+);
