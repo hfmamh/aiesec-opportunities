@@ -1,9 +1,10 @@
 # Opportunities & Convocatorias Pipeline
 
-Daily, cloud-hosted pipeline that tracks three job-listing sources, keeps a
-full history of when items appear/change/close, and feeds a Looker Studio
-dashboard. Runs on GitHub Actions; storage is Supabase (Postgres + object
-storage). No server, no local machine dependency, $0/month at
+Cloud-hosted pipeline (runs every 4 hours) that tracks three job-listing
+sources, keeps a full history of when items appear/change/close, notifies
+new items on Telegram, answers questions about them through a Telegram bot,
+and feeds a Looker Studio dashboard. Runs on GitHub Actions plus one
+Supabase Edge Function; storage is Supabase (Postgres + object storage). No server, no local machine dependency, $0/month at
 personal-project scale.
 
 - **AIESEC**: fetches AIESEC's GraphQL opportunities feed.
@@ -64,11 +65,10 @@ always answer "when did this first appear" or "when did it close".
   6. Sends one grouped Telegram message for that run's newly created items
      (best-effort — a notification failure is logged but doesn't fail the
      run, since the data sync already succeeded). All three sources use the
-     same Telegram bot, but `getonboard` posts to a **separate chat** from
-     `aiesec`/`convocatorias` (see "Notification channels" below) — it's the
-     user's personal Data Engineer job search, not an AIESEC/convocatorias
-     opportunity, and they're kept out of the same conversation
-     deliberately.
+     same Telegram bot, but each posts to its own chat: `aiesec` and
+     `getonboard` to the chat in `notification_channels`, and each
+     convocatorias topic to the chat in `convocatoria_topics` (see
+     "Notification channels" below).
 - `scripts/aiesec_client.py` pages through the full GraphQL result set for
   today's opportunities.
 - `scripts/convocatorias_client.py` pages through
@@ -136,12 +136,19 @@ or a group/channel the bot has been added to), then open
 row here, its notification step fails loudly (logged, doesn't fail the
 sync) rather than silently going nowhere.
 
-`getonboard` deliberately uses a **different chat** from `aiesec`/
-`convocatorias`, even though all three use the same bot/token — a Telegram
-bot's DM with a given user is always the same single chat, so the simplest
-way to get a second, separate destination for the same bot is a small
-Telegram group with just you + the bot in it (group chat_ids are negative
-numbers), used only for `getonboard` notifications:
+**Once the Telegram bot's webhook is set** (see "Telegram bot" below),
+`getUpdates` returns a 409 error instead of updates: Telegram only delivers
+updates one way at a time. To read a new chat's id, temporarily remove the
+webhook with `https://api.telegram.org/bot<TOKEN>/deleteWebhook`, send the
+message, read it from `getUpdates`, then set the webhook again with the
+`setWebhook` call in that section. The bot doesn't answer questions while
+the webhook is removed.
+
+Each destination is a **different chat**, even though all of them use the
+same bot/token — a Telegram bot's DM with a given user is always the same
+single chat, so the simplest way to get another, separate destination for
+the same bot is a small Telegram group with just you + the bot in it (group
+chat_ids are negative numbers). For example, for `getonboard`:
 
 1. In the Telegram app, create a new group (New Message -> New Group), add
    no other members, and give it any name (e.g. "Get on Board jobs").
@@ -189,7 +196,45 @@ insert into convocatoria_keywords (topic_slug, keyword, is_active) values
   notification** workflow (Actions tab): it sends one live listing to the
   topic's chat without writing to the database.
 
-### 5. Looker Studio dashboard
+### 5. Telegram bot (`telegram-resumen` Edge Function)
+
+Besides the push notifications above, the same bot answers messages in real
+time through the Supabase Edge Function `supabase/functions/telegram-resumen`
+(Telegram webhook → Edge Function → Gemini → reply). It's separate from the
+sync: the GitHub Actions job doesn't call it, and it only reads from the
+database (plus its own `telegram_bot_sessions` table).
+
+Commands (in a DM or a group the bot is in):
+
+| Message | What it does |
+|---|---|
+| `/usar_convocatorias`, `/usar_aiesec`, `/usar_getonboard` | Picks this chat's active source, saved in `telegram_bot_sessions` until changed. Required before anything else. |
+| `/resumen` | Gemini summary of the active source: new this week + currently active. |
+| Any other text not starting with `/` | Free-form question about the active source (e.g. "¿qué hay en Arequipa?", "¿cuál paga más?"). Gemini answers it via two fixed, parameterized queries (`buscar`, `recientes`) — never model-written SQL. |
+
+Other commands (e.g. `/start`) and non-text messages are ignored.
+`/usar_convocatorias` covers all convocatorias topics together; the bot
+doesn't separate them by topic.
+
+Setup:
+
+1. Run `sql/migrations/0007_add_telegram_bot_sessions.sql` in the SQL
+   editor (already included in `sql/schema.sql` for a fresh install).
+2. Set the function's secrets (Supabase dashboard -> Edge Functions ->
+   Secrets, or `supabase secrets set`): `TELEGRAM_BOT_TOKEN` (same bot as
+   the notifications), `GEMINI_API_KEY` (free-tier Gemini API key) and
+   `TELEGRAM_WEBHOOK_SECRET` (any random string you choose). `SUPABASE_URL`
+   and `SUPABASE_SERVICE_ROLE_KEY` are injected automatically.
+3. Deploy it without JWT verification (Telegram can't send a Supabase JWT;
+   requests are authenticated by the webhook secret instead):
+   `supabase functions deploy telegram-resumen --no-verify-jwt`.
+4. Point the bot's webhook at it, with the same secret:
+   `https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<project-ref>.supabase.co/functions/v1/telegram-resumen&secret_token=<TELEGRAM_WEBHOOK_SECRET>`.
+
+After changing `index.ts`, redeploy (step 3) and commit the change, so the
+repo and the deployed function stay the same.
+
+### 6. Looker Studio dashboard
 
 1. In Supabase, go to Project Settings -> Database and copy the connection
    pooler host/port/database/user/password.
