@@ -15,8 +15,9 @@
 // peruano, Get on Board) are supported identically through the SourceConfig
 // below — adding a fourth source means adding one config entry, not new
 // handler code. Everything else (the 4h cron sync in scripts/sync.py, its
-// own Telegram notifications via scripts/notifier.py, which push to three
-// separate per-source broadcast channels) is untouched; this is a separate,
+// own Telegram notifications via scripts/notifier.py, which push to one chat
+// per source for aiesec/getonboard and one chat per topic for convocatorias)
+// is untouched; this is a separate,
 // always-on entry point that lives only here under supabase/functions/.
 //
 // Required secrets (set via `supabase secrets set` / the dashboard, never
@@ -32,7 +33,7 @@
 // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are injected automatically into
 // every Edge Function's environment — no secret to set for those.
 //
-// Requires the telegram_bot_sessions table (sql/migrations/0006_add_telegram_bot_sessions.sql).
+// Requires the telegram_bot_sessions table (sql/migrations/0007_add_telegram_bot_sessions.sql).
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
