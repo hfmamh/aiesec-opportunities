@@ -227,25 +227,40 @@ def _format_convocatoria(row, index):
     return "\n".join(lines)
 
 
-def _convocatorias_header(count, chunk_index, chunk_count):
+def _convocatorias_header(count, nombre, chunk_index, chunk_count):
     noun = "nueva convocatoria" if count == 1 else "nuevas convocatorias"
-    header = f"<b>{count} {noun} del Estado</b>"
+    header = f"<b>{count} {noun} del Estado · {html.escape(nombre)}</b>"
     if chunk_count > 1:
         header += f" ({chunk_index}/{chunk_count})"
     return header
 
 
-def notify_new_convocatorias(client, rows):
+def notify_convocatoria_topic(chat_id, nombre, rows):
     """Sends one or more grouped summary messages (chunked to Telegram's
-    character limit) for newly created convocatorias, to whatever chat
-    notification_channels has configured for source='convocatorias'. Same
-    no-op/raise contract as notify_new_opportunities."""
+    character limit) for `rows` to one topic's chat. No-op on empty rows;
+    raises on a Telegram failure."""
     if not rows:
         return
-    chat_id = chat_id_for_source(client, "convocatorias")
     count = len(rows)
     blocks = [_format_convocatoria(row, i) for i, row in enumerate(rows, start=1)]
-    _send_grouped(chat_id, lambda i, total: _convocatorias_header(count, i, total), blocks)
+    _send_grouped(chat_id, lambda i, total: _convocatorias_header(count, nombre, i, total), blocks)
+
+
+def notify_convocatoria_topics(client, notifications):
+    """Sends each topic's new convocatorias to that topic's chat.
+    `notifications` is sync.record_topic_matches' output: a list of
+    {"chat_id", "nombre", "rows"}. One topic failing doesn't stop the
+    others; if any failed, raises afterwards naming them. `client` is
+    unused (chat_ids come from convocatoria_topics already) but kept so
+    this matches the other notify_* functions' signature."""
+    failures = []
+    for notification in notifications:
+        try:
+            notify_convocatoria_topic(notification["chat_id"], notification["nombre"], notification["rows"])
+        except Exception as exc:
+            failures.append(f"{notification['nombre']}: {exc}")
+    if failures:
+        raise RuntimeError("; ".join(failures))
 
 
 # ============================================================

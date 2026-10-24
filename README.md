@@ -17,11 +17,12 @@ personal-project scale.
   `/convocatorias/`, and has a paid API for higher-volume use that wasn't in
   budget for this project — so this pipeline scrapes its HTML instead, at a
   polite request rate (one page every 0.5s). Rather than the full catalog
-  (~190 pages), it narrows the fetch server-side to the keywords listed in
-  the `convocatoria_keywords` table, using the site's own `?q=kw1,kw2`
-  search (OR semantics) — a run currently fetches a handful of pages, not
-  190. This scope applies to both storage and Telegram notifications: what
-  isn't fetched is never saved or notified.
+  (~190 pages), it narrows the fetch server-side to **topics**
+  (`convocatoria_topics`): one `?q=kw1,kw2` search (OR semantics) per topic,
+  with that topic's keywords from `convocatoria_keywords`, and each topic
+  notifies its own Telegram chat. A run currently fetches a handful of
+  pages per topic, not 190. This scope applies to both storage and Telegram
+  notifications: what isn't fetched is never saved or notified.
 - **Get on Board**: scrapes the public job-tag listing page at
   [getonbrd.com.pe](https://www.getonbrd.com.pe/jobs/tag/data-engineer) for
   the "data-engineer" tag (only tag wired up so far, hardcoded in
@@ -71,11 +72,15 @@ always answer "when did this first appear" or "when did it close".
 - `scripts/aiesec_client.py` pages through the full GraphQL result set for
   today's opportunities.
 - `scripts/convocatorias_client.py` pages through
-  `convocatoriasestado.pe/convocatorias/?q=<keywords>&page=N` (keywords come
-  from `convocatoria_keywords`, read fresh each run by `sync.py`) and parses
-  each listing card's HTML. If there are zero active keywords, the run skips
-  the fetch entirely (0 items, still a success) rather than falling back to
-  scraping the full catalog.
+  `convocatoriasestado.pe/convocatorias/?q=<keywords>&page=N` once per
+  active topic (topics and keywords come from `convocatoria_topics` /
+  `convocatoria_keywords`, read fresh each run by `sync.py`) and parses each
+  listing card's HTML. The union of all topics' listings is snapshotted and
+  diffed into one `convocatorias_dim`; `convocatoria_topic_matches` tracks
+  which listing was already sent to which topic, so a listing matching two
+  topics reaches both chats, once each. If there are zero active topics, the
+  run skips the fetch entirely (0 items, still a success) rather than
+  falling back to scraping the full catalog.
 - `scripts/getonboard_client.py` fetches
   `getonbrd.com.pe/jobs/tag/data-engineer` (one page, no detail-page
   fetches — see the module docstring for why) and parses each card's HTML.
@@ -118,9 +123,11 @@ For each source, insert a row into `notification_channels` (SQL editor):
 ```sql
 insert into notification_channels (source, chat_id) values
   ('aiesec', '<chat id>'),
-  ('convocatorias', '<chat id>'),
   ('getonboard', '<chat id>');
 ```
+
+Convocatorias are the exception: each convocatorias topic has its own
+`chat_id` in `convocatoria_topics` (see step 4).
 
 To get a chat's `chat_id`: send any message in that chat (a DM to the bot,
 or a group/channel the bot has been added to), then open
@@ -147,24 +154,40 @@ numbers), used only for `getonboard` notifications:
    `insert into notification_channels ... ('getonboard', '<chat id>')`
    above.
 
-### 4. Convocatorias keywords
+### 4. Convocatorias topics and keywords
 
 The convocatorias source only fetches (and therefore only ever stores or
-notifies) listings matching one of the keywords in `convocatoria_keywords` —
-also a database row, not a config file, so changing scope doesn't need a
-deploy. Seed it with whatever's relevant (SQL editor):
+notifies) listings matching a **topic**'s keywords. Each topic is one
+Telegram chat with its own keywords, all database rows, so adding a topic
+doesn't need a deploy. For each topic, create a Telegram group with the bot
+in it (same steps as the `getonboard` group above), then (SQL editor):
 
 ```sql
-insert into convocatoria_keywords (keyword, is_active) values
-  ('Biologo', true),
-  ('Biologia', true);
+insert into convocatoria_topics (slug, nombre, chat_id) values
+  ('biologia', 'Biología', '<chat id>'),
+  ('ambiental', 'Ingeniería Ambiental', '<chat id>');
+
+insert into convocatoria_keywords (topic_slug, keyword, is_active) values
+  ('biologia', 'Biologo', true),
+  ('biologia', 'Biologia', true),
+  ('ambiental', 'Ingeniería Ambiental', true);
 ```
 
-Keywords are OR'd (matches any, not all) via the site's own `?q=kw1,kw2`
-search. Deactivate one with `update convocatoria_keywords set is_active =
-false where keyword = '...'` rather than deleting it, to keep the history of
-what's been searched. If every row is inactive, the run skips the fetch
-(0 items, still a success) instead of falling back to the full catalog.
+- A topic's keywords are OR'd (matches any, not all) via the site's own
+  `?q=kw1,kw2` search, which ignores accents and also matches the required
+  degree, not just the title.
+- A listing that matches several topics is notified to each of their chats,
+  once per chat (`convocatoria_topic_matches`).
+- A brand-new topic's first run records what it currently matches **without
+  notifying**, so its chat isn't flooded with every listing already open.
+  Set `notify_first_run = true` on the topic to send them instead.
+- Deactivate a keyword or topic with `is_active = false` rather than
+  deleting it, to keep the history. If no topic is active (with at least one
+  active keyword), the run skips the fetch (0 items, still a success)
+  instead of falling back to the full catalog.
+- Try a topic before activating it with the **Test convocatoria
+  notification** workflow (Actions tab): it sends one live listing to the
+  topic's chat without writing to the database.
 
 ### 5. Looker Studio dashboard
 
