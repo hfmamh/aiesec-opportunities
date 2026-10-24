@@ -9,8 +9,9 @@ the only courtesy this needs.
 Callers should normally pass `keywords` (see fetch_all/fetch_page) so this
 narrows to the site's own server-side search (?q=kw1,kw2, OR semantics)
 instead of scraping the entire catalog (~191 pages / ~3,800 listings as of
-2026-09). sync.py sources the active keyword list from the
-`convocatoria_keywords` table. `keywords=None` still scrapes everything,
+2026-09). sync.py calls fetch_all once per active topic in
+`convocatoria_topics`, with that topic's keywords from
+`convocatoria_keywords`. `keywords=None` still scrapes everything,
 for callers that explicitly want the unfiltered catalog.
 
 Follows the same shape as aiesec_client.py: FIELD_EXTRACTORS is the single

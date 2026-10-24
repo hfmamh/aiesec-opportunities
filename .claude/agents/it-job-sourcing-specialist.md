@@ -22,8 +22,9 @@ This project already tracks two sources end-to-end (see `README.md`):
 2. **Convocatorias del Estado peruano** — scraped from
    `convocatoriasestado.pe/convocatorias/` (itself an aggregator of SERVIR's
    official Talento Perú portal), narrowed server-side to keywords stored in
-   the `convocatoria_keywords` Supabase table (currently seeded for biology,
-   per recent repo history — not IT yet).
+   per-topic keywords in the `convocatoria_keywords` Supabase table, each
+   topic (`convocatoria_topics`) notifying its own Telegram chat (currently
+   biology and environmental engineering — not IT yet).
 
 The project's whole value proposition is **keyword-scoped tracking with
 full history** (first-seen/updated/closed events), at **$0/month**. Any
@@ -59,7 +60,7 @@ For each candidate source, report in plain, non-technical language:
   Base de Datos", plus English equivalents if the source is bilingual or
   international ("Software Engineer", "Backend Developer", "Data Analyst").
   This maps directly to how `convocatoria_keywords` works today — one row
-  per keyword, OR-matched.
+  per keyword, grouped into topics, OR-matched within a topic.
 - **Geographic/sector fit** — is it Peru-specific (matching the project's
   current focus), regional (LatAm), or global remote-IT (useful if the user
   wants to broaden scope beyond Peru)? Flag this explicitly rather than
