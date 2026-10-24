@@ -102,15 +102,40 @@ create table convocatoria_events (
 create index on convocatorias_snapshot (id);
 create index on convocatoria_events (convocatoria_id);
 
--- Narrows what convocatorias_client.py fetches to only listings matching one
--- of these keywords (OR semantics, via the site's own ?q= search), instead
--- of scraping the entire catalog. Editable without a deploy — sync.py reads
--- the active rows on every run. Seed with real keywords before the first
--- run, e.g.: insert into convocatoria_keywords (keyword) values ('Biologo').
-create table convocatoria_keywords (
-  keyword text primary key,
+-- Topics: each one is a Telegram channel with its own keywords. sync.py runs
+-- one ?q= search per active topic (its keywords OR'd), diffs the union into
+-- convocatorias_dim, and notifies each topic's chat about listings that are
+-- new for that topic (convocatoria_topic_matches). Adding a topic is a data
+-- change, no deploy. notify_first_run=false means a new topic's first run
+-- records what it matches without notifying (no flood of old listings).
+create table convocatoria_topics (
+  slug text primary key,
+  nombre text not null,
+  chat_id text not null,
   is_active boolean not null default true,
+  notify_first_run boolean not null default false,
   created_at timestamptz not null default now()
+);
+
+-- Narrows what convocatorias_client.py fetches for each topic to only
+-- listings matching one of that topic's keywords, instead of scraping the
+-- entire catalog. Editable without a deploy; sync.py reads the active rows
+-- on every run. e.g.: insert into convocatoria_keywords (topic_slug,
+-- keyword) values ('biologia', 'Biologo').
+create table convocatoria_keywords (
+  topic_slug text not null references convocatoria_topics(slug),
+  keyword text not null,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  primary key (topic_slug, keyword)
+);
+
+-- Which listing has already been notified to which topic.
+create table convocatoria_topic_matches (
+  convocatoria_id text not null,
+  topic_slug text not null references convocatoria_topics(slug),
+  matched_at timestamptz not null default now(),
+  primary key (convocatoria_id, topic_slug)
 );
 
 -- ============================================================
@@ -118,7 +143,7 @@ create table convocatoria_keywords (
 -- Scraped from getonbrd.com.pe's public job-tag listing page. There's no
 -- numeric id in the listing HTML, so `id` is the job's URL path. Only one
 -- tag is fetched for now ("data-engineer", hardcoded in the client), not a
--- configurable table like convocatoria_keywords.
+-- configurable table like convocatoria_keywords/convocatoria_topics.
 -- ============================================================
 
 create table getonboard_snapshot (
@@ -183,7 +208,8 @@ create index on ingestion_runs (source, run_at);
 
 -- Maps each source to the Telegram chat its notifications go to, so adding
 -- a channel (or moving a source to a different chat) is a data change, not
--- a code/secret change. Seed with real chat_id values before the first run,
+-- a code/secret change. Convocatorias don't use this: each of their topics
+-- carries its own chat_id in convocatoria_topics. Seed with real chat_id values before the first run,
 -- e.g.: insert into notification_channels values ('aiesec', '<chat id>').
 create table notification_channels (
   source text primary key,

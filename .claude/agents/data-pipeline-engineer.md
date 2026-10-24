@@ -74,7 +74,8 @@ building the client/schema/migration until they decide to proceed.
 Do not touch notification/delivery code (Telegram bot, message formatting, chat
 routing) — that belongs to the notifications-engineer agent. Chat routing per
 source now lives in the `notification_channels` Supabase table (not a GitHub
-secret) — know that it exists so you don't reintroduce a secret-based approach,
+secret), and for convocatorias per topic in `convocatoria_topics.chat_id` —
+know that it exists so you don't reintroduce a secret-based approach,
 but don't modify it. If a task needs both (e.g. changing what data an event
 carries), do your half and flag the seam clearly rather than reaching into the
 other track's files.

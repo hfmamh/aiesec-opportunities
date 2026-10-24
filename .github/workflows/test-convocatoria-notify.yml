@@ -1,13 +1,17 @@
 name: Test convocatoria notification
 
-# Scrapes one live convocatoria and sends it to the convocatorias Telegram
-# chat, without writing anything to the database. See
+# Scrapes one live convocatoria for a topic and sends it to that topic's
+# Telegram chat, without writing anything to the database. See
 # scripts/test_convocatoria_notification.py.
 on:
   workflow_dispatch:
     inputs:
+      topic:
+        description: "Topic slug from convocatoria_topics (e.g. biologia, ambiental)"
+        required: true
+        default: "biologia"
       keyword:
-        description: "Search keyword (blank = active convocatoria_keywords)"
+        description: "Search keyword (blank = the topic's active keywords)"
         required: false
         default: ""
 
@@ -28,4 +32,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TEST_TOPIC: ${{ inputs.topic }}
           TEST_KEYWORD: ${{ inputs.keyword }}
