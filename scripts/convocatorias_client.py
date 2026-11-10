@@ -42,9 +42,22 @@ MAX_PAGES = 500  # safety cap; real loop stops as soon as a page has 0 cards
 ARTICLE_RE = re.compile(r'<article class="card">(.*?)</article>', re.DOTALL)
 LINK_RE = re.compile(r'<a href="(/convocatoria/(\d+)-[^"]*?/)"[^>]*>([^<]+)</a>', re.DOTALL)
 ENTIDAD_RE = re.compile(r'<p class="card-entidad">([^<]*)</p>')
+# Card layout since ~2026-11: a <dl class="card-datos"> with one
+# <div class="card-dato ..."> per field, identified by its icon, e.g.
+#   <div class="card-dato card-dato-sueldo"><dt><svg ...><use href="#i-billete"/></svg>Sueldo</dt><dd>S/ 1,381</dd></div>
+#   <div class="card-dato"><dt>...#i-pin...Lugar</dt><dd>Lima<span class="card-dato-sub">San Borja</span></dd></div>
+# CARD_DATO_RE captures (icon name, raw <dd> inner HTML).
+CARD_DATO_RE = re.compile(
+    r'<div class="card-dato[^"]*">\s*<dt>.*?#i-([a-z-]+)".*?</dt>\s*<dd>(.*?)</dd>',
+    re.DOTALL,
+)
+DATO_SUB_RE = re.compile(r'<span class="card-dato-sub">([^<]*)</span>')
+TAG_RE = re.compile(r"<[^>]+>")
+
+# Legacy card layout (before ~2026-11), kept as a fallback in case the site
+# serves the old markup again. The site has emitted both <use ...></use> and
+# self-closing <use .../>, so match either form up to the closing </svg>.
 SUELDO_RE = re.compile(r'<span class="sueldo">([^<]*)</span>')
-# The site has emitted both <use ...></use> and self-closing <use .../>, so
-# match either form up to the closing </svg>.
 UBICACION_RE = re.compile(r'#i-pin"\s*/?>(?:</use>)?</svg>([^<]*)</span>')
 VACANTES_RE = re.compile(r'#i-vacantes"\s*/?>(?:</use>)?</svg>([^<]*)</span>')
 MODALIDAD_RE = re.compile(r'#i-maletin"\s*/?>(?:</use>)?</svg>([^<]*)</span>')
@@ -57,6 +70,29 @@ CIERRE_DIAS_RE = re.compile(r"en (\d+)\s*d[ií]a")
 
 def _text(match):
     return html.unescape(match.group(1)).strip() if match else None
+
+
+def _strip_tags(raw):
+    text = html.unescape(TAG_RE.sub("", raw)).strip()
+    return text or None
+
+
+def _parse_card_datos(chunk):
+    """Returns {icon_name: raw_value} for the new <dl class="card-datos">
+    layout. The pin (Lugar) value is normalized to 'Departamento · Distrito'
+    (or just 'Departamento') so _split_ubicacion handles both layouts."""
+    datos = {}
+    for icon, dd in CARD_DATO_RE.findall(chunk):
+        if icon == "pin":
+            sub = DATO_SUB_RE.search(dd)
+            main = _strip_tags(DATO_SUB_RE.sub("", dd))
+            if sub and main and sub.group(1).strip():
+                datos[icon] = f"{main} · {html.unescape(sub.group(1)).strip()}"
+            else:
+                datos[icon] = main
+        else:
+            datos[icon] = _strip_tags(dd)
+    return datos
 
 
 def _parse_int(raw):
@@ -117,15 +153,17 @@ def _parse_article(chunk):
     if not link:
         return None
 
+    datos = _parse_card_datos(chunk)
+
     return {
         "id": link.group(2),
         "url_path": link.group(1),
         "titulo_raw": link.group(3),
         "entidad_raw": _text(ENTIDAD_RE.search(chunk)),
-        "sueldo_raw": _text(SUELDO_RE.search(chunk)),
-        "ubicacion_raw": _text(UBICACION_RE.search(chunk)),
-        "vacantes_raw": _text(VACANTES_RE.search(chunk)),
-        "modalidad_raw": _text(MODALIDAD_RE.search(chunk)),
+        "sueldo_raw": datos.get("billete") or _text(SUELDO_RE.search(chunk)),
+        "ubicacion_raw": datos.get("pin") or _text(UBICACION_RE.search(chunk)),
+        "vacantes_raw": datos.get("vacantes") or _text(VACANTES_RE.search(chunk)),
+        "modalidad_raw": datos.get("maletin") or _text(MODALIDAD_RE.search(chunk)),
         "bases_raw": _text(BASES_RE.search(chunk)),
         "cierre_raw": _text(CIERRE_RE.search(chunk)),
     }
